@@ -14,7 +14,9 @@ EDGE_COVERAGE_THRESHOLD = 0.9
 MIN_EDGE_RATIO = 0.01
 DEFAULT_INPUT_DIR = "input"
 DEFAULT_OUTPUT_DIR = "output"
+DEFAULT_FRAME_INTERVAL_SECONDS = 2.0
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 
 def parse_args():
@@ -22,18 +24,10 @@ def parse_args():
         description="Detect a single-color ad region and report its size and area percentage."
     )
     parser.add_argument(
-        "--image",
-        help="Path to a single input image. If omitted, the script processes the whole input folder.",
-    )
-    parser.add_argument(
-        "--input-dir",
-        default=DEFAULT_INPUT_DIR,
-        help=f"Input folder for batch processing. Default: {DEFAULT_INPUT_DIR}",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=DEFAULT_OUTPUT_DIR,
-        help=f"Output folder for batch processing. Default: {DEFAULT_OUTPUT_DIR}",
+        "--source",
+        required=True,
+        choices=["images", "videos"],
+        help="Choose the batch input source under input/: images or videos.",
     )
     parser.add_argument(
         "--color",
@@ -57,8 +51,10 @@ def parse_args():
         help="Print the result as JSON.",
     )
     parser.add_argument(
-        "--output",
-        help="Optional path for the annotated output image in single-image mode.",
+        "--frame-interval",
+        type=float,
+        default=DEFAULT_FRAME_INTERVAL_SECONDS,
+        help=f"Frame capture interval in seconds for video mode. Default: {DEFAULT_FRAME_INTERVAL_SECONDS}",
     )
     return parser.parse_args()
 
@@ -396,15 +392,15 @@ def build_dimensions(shape_name, bbox, edges, edge_pair):
     }
 
 
-def default_output_path(image_path, input_dir=None, output_dir=None):
-    resolved_input_dir = Path(input_dir) if input_dir is not None else Path(DEFAULT_INPUT_DIR)
-    resolved_output_dir = Path(output_dir) if output_dir is not None else Path(DEFAULT_OUTPUT_DIR)
-    if image_path.parent.resolve() == resolved_input_dir.resolve():
-        return resolved_output_dir / f"{image_path.stem}_detected.png"
-    return image_path.with_name(f"{image_path.stem}_detected.png")
+def input_source_dir(source_name):
+    return Path(DEFAULT_INPUT_DIR) / source_name
 
 
-def default_batch_output_path(image_path, output_dir):
+def output_source_dir(source_name):
+    return Path(DEFAULT_OUTPUT_DIR) / source_name
+
+
+def detection_output_path(image_path, output_dir):
     return output_dir / f"{image_path.stem}_detected.png"
 
 
@@ -416,8 +412,69 @@ def is_supported_image_file(path):
     )
 
 
-def find_input_images(input_dir):
-    return sorted(path for path in input_dir.iterdir() if is_supported_image_file(path))
+def is_supported_video_file(path):
+    return path.is_file() and path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
+
+
+def find_source_files(source_dir, source_name):
+    if source_name == "images":
+        return sorted(path for path in source_dir.iterdir() if is_supported_image_file(path))
+    return sorted(path for path in source_dir.iterdir() if is_supported_video_file(path))
+
+
+def format_timestamp_tag(seconds):
+    return f"{seconds:08.2f}".replace(".", "_")
+
+
+def extract_frames_from_video(video_path, frames_dir, frame_interval_seconds):
+    if frame_interval_seconds <= 0:
+        raise ValueError("--frame-interval must be greater than 0.")
+
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps <= 0:
+        fps = 1.0
+
+    frame_step = max(1, int(round(fps * frame_interval_seconds)))
+    extracted_frames = []
+    frame_index = 0
+    next_capture_index = 0
+    capture_index = 0
+
+    while True:
+        success, frame_bgr = capture.read()
+        if not success:
+            break
+
+        if capture_index >= next_capture_index:
+            timestamp_seconds = capture_index / fps
+            frame_name = (
+                f"{video_path.stem}_frame_{frame_index:04d}_t{format_timestamp_tag(timestamp_seconds)}s.png"
+            )
+            frame_path = frames_dir / frame_name
+            cv2.imwrite(str(frame_path), frame_bgr)
+            extracted_frames.append(
+                {
+                    "frame_path": frame_path,
+                    "frame_index": capture_index,
+                    "timestamp_seconds": round(timestamp_seconds, 3),
+                }
+            )
+            frame_index += 1
+            next_capture_index += frame_step
+
+        capture_index += 1
+
+    capture.release()
+
+    if not extracted_frames:
+        raise RuntimeError(f"No frames extracted from video: {video_path}")
+
+    return extracted_frames
 
 
 def choose_annotation_color(ad_color_rgb):
@@ -845,15 +902,16 @@ def process_single_image(image_path, color_hint, shape_hint, tolerance, output_p
     return result
 
 
-def process_image_directory(input_dir, output_dir, color_hint, shape_hint, tolerance):
-    if not input_dir.exists():
-        raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
-    if not input_dir.is_dir():
-        raise NotADirectoryError(f"Input path is not a folder: {input_dir}")
+def process_image_directory(source_dir, output_dir, color_hint, shape_hint, tolerance):
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Input folder does not exist: {source_dir}")
+    if not source_dir.is_dir():
+        raise NotADirectoryError(f"Input path is not a folder: {source_dir}")
 
-    image_paths = find_input_images(input_dir)
+    image_paths = find_source_files(source_dir, "images")
     summary = {
-        "input_dir": str(input_dir),
+        "source": "images",
+        "input_dir": str(source_dir),
         "output_dir": str(output_dir),
         "processed_count": len(image_paths),
         "success_count": 0,
@@ -863,7 +921,7 @@ def process_image_directory(input_dir, output_dir, color_hint, shape_hint, toler
     }
 
     for image_path in image_paths:
-        output_path = default_batch_output_path(image_path, output_dir)
+        output_path = detection_output_path(image_path, output_dir)
         try:
             result = process_single_image(
                 image_path=image_path,
@@ -886,7 +944,99 @@ def process_image_directory(input_dir, output_dir, color_hint, shape_hint, toler
     return summary
 
 
-def print_batch_human_readable(summary):
+def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tolerance, frame_interval_seconds):
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Input folder does not exist: {source_dir}")
+    if not source_dir.is_dir():
+        raise NotADirectoryError(f"Input path is not a folder: {source_dir}")
+
+    video_paths = find_source_files(source_dir, "videos")
+    summary = {
+        "source": "videos",
+        "input_dir": str(source_dir),
+        "output_dir": str(output_dir),
+        "frame_interval_seconds": frame_interval_seconds,
+        "processed_count": len(video_paths),
+        "success_count": 0,
+        "error_count": 0,
+        "total_extracted_frames": 0,
+        "total_detected_frames": 0,
+        "total_frame_errors": 0,
+        "videos": [],
+        "errors": [],
+    }
+
+    for video_path in video_paths:
+        video_output_dir = output_dir / video_path.stem
+        frames_dir = video_output_dir / "frames"
+        detections_dir = video_output_dir / "detections"
+
+        try:
+            extracted_frames = extract_frames_from_video(
+                video_path=video_path,
+                frames_dir=frames_dir,
+                frame_interval_seconds=frame_interval_seconds,
+            )
+            video_summary = {
+                "video_path": str(video_path),
+                "frames_dir": str(frames_dir),
+                "detections_dir": str(detections_dir),
+                "frame_interval_seconds": frame_interval_seconds,
+                "extracted_frame_count": len(extracted_frames),
+                "success_count": 0,
+                "error_count": 0,
+                "results": [],
+                "errors": [],
+            }
+
+            for frame_info in extracted_frames:
+                frame_path = frame_info["frame_path"]
+                output_path = detection_output_path(frame_path, detections_dir)
+                try:
+                    result = process_single_image(
+                        image_path=frame_path,
+                        color_hint=color_hint,
+                        shape_hint=shape_hint,
+                        tolerance=tolerance,
+                        output_path=output_path,
+                    )
+                    result["frame_index"] = frame_info["frame_index"]
+                    result["timestamp_seconds"] = frame_info["timestamp_seconds"]
+                    video_summary["results"].append(result)
+                    video_summary["success_count"] += 1
+                except Exception as exc:
+                    video_summary["errors"].append(
+                        {
+                            "frame_path": str(frame_path),
+                            "frame_index": frame_info["frame_index"],
+                            "timestamp_seconds": frame_info["timestamp_seconds"],
+                            "error": str(exc),
+                        }
+                    )
+                    video_summary["error_count"] += 1
+
+            summary["videos"].append(video_summary)
+            summary["total_extracted_frames"] += video_summary["extracted_frame_count"]
+            summary["total_detected_frames"] += video_summary["success_count"]
+            summary["total_frame_errors"] += video_summary["error_count"]
+            if video_summary["error_count"] == 0:
+                summary["success_count"] += 1
+            else:
+                summary["error_count"] += 1
+        except Exception as exc:
+            summary["errors"].append(
+                {
+                    "video_path": str(video_path),
+                    "error": str(exc),
+                }
+            )
+            summary["error_count"] += 1
+
+    return summary
+
+
+def print_image_batch_human_readable(summary):
+    print(f"Source: {summary['source']}")
     print(f"Input folder: {summary['input_dir']}")
     print(f"Output folder: {summary['output_dir']}")
     print(
@@ -912,43 +1062,94 @@ def print_batch_human_readable(summary):
         print(f"Error: {error_info['error']}")
 
 
+def print_video_batch_human_readable(summary):
+    print(f"Source: {summary['source']}")
+    print(f"Input folder: {summary['input_dir']}")
+    print(f"Output folder: {summary['output_dir']}")
+    print(f"Frame interval: {summary['frame_interval_seconds']} s")
+    print(
+        "Processed videos: "
+        f"{summary['processed_count']} | "
+        f"Success: {summary['success_count']} | "
+        f"Errors: {summary['error_count']}"
+    )
+    print(
+        "Frames: "
+        f"Extracted {summary['total_extracted_frames']} | "
+        f"Detected {summary['total_detected_frames']} | "
+        f"Frame errors {summary['total_frame_errors']}"
+    )
+
+    if not summary["videos"] and not summary["errors"]:
+        print("No supported video files found.")
+        return
+
+    for index, video_summary in enumerate(summary["videos"], start=1):
+        print()
+        print(f"--- Video {index} ---")
+        print(f"Video: {video_summary['video_path']}")
+        print(f"Frames folder: {video_summary['frames_dir']}")
+        print(f"Detections folder: {video_summary['detections_dir']}")
+        print(
+            "Extracted frames: "
+            f"{video_summary['extracted_frame_count']} | "
+            f"Success: {video_summary['success_count']} | "
+            f"Errors: {video_summary['error_count']}"
+        )
+
+        for frame_index, result in enumerate(video_summary["results"], start=1):
+            print()
+            print(
+                f"--- Frame {frame_index} "
+                f"(t={result['timestamp_seconds']:.3f}s, idx={result['frame_index']}) ---"
+            )
+            print_human_readable(result)
+
+        for frame_index, error_info in enumerate(video_summary["errors"], start=1):
+            print()
+            print(
+                f"--- Frame Error {frame_index} "
+                f"(t={error_info['timestamp_seconds']:.3f}s, idx={error_info['frame_index']}) ---"
+            )
+            print(f"Frame: {error_info['frame_path']}")
+            print(f"Error: {error_info['error']}")
+
+    for index, error_info in enumerate(summary["errors"], start=1):
+        print()
+        print(f"--- Video Error {index} ---")
+        print(f"Video: {error_info['video_path']}")
+        print(f"Error: {error_info['error']}")
+
+
+def print_batch_human_readable(summary):
+    if summary["source"] == "videos":
+        print_video_batch_human_readable(summary)
+        return
+    print_image_batch_human_readable(summary)
+
+
 def main():
     args = parse_args()
-    if args.image:
-        image_path = Path(args.image)
-        output_path = (
-            Path(args.output)
-            if args.output
-            else default_output_path(
-                image_path=image_path,
-                input_dir=args.input_dir,
-                output_dir=args.output_dir,
-            )
-        )
-        result = process_single_image(
-            image_path=image_path,
+    source_dir = input_source_dir(args.source)
+    output_dir = output_source_dir(args.source)
+
+    if args.source == "videos":
+        summary = process_video_directory(
+            source_dir=source_dir,
+            output_dir=output_dir,
             color_hint=args.color,
             shape_hint=args.shape,
             tolerance=args.tolerance,
-            output_path=output_path,
+            frame_interval_seconds=args.frame_interval,
         )
-
-        if args.json:
-            print(json.dumps(result, indent=2))
-        else:
-            print_human_readable(result)
-        return
-
-    if args.output:
-        raise ValueError("--output can only be used together with --image.")
-
-    summary = process_image_directory(
-        input_dir=Path(args.input_dir),
-        output_dir=Path(args.output_dir),
-        color_hint=args.color,
-        shape_hint=args.shape,
-        tolerance=args.tolerance,
-    )
+    else:
+        summary = process_image_directory(
+            source_dir=source_dir,
+            output_dir=output_dir,
+            color_hint=args.color,
+            shape_hint=args.shape,
+            tolerance=args.tolerance,
+        )
 
     if args.json:
         print(json.dumps(summary, indent=2))
