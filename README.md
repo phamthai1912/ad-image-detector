@@ -1,27 +1,25 @@
 # Ad Image Detector
 
-Script Python để detect vùng quảng cáo (`ad`) đơn sắc trong ảnh và tính:
+Script Python để detect vùng quảng cáo (`ad`) đơn sắc trong ảnh và trả về:
 
-- kích thước các cạnh hoặc nhánh của ad
+- màu của ad
+- shape của ad: `l`, `rectangle`, `square`
+- kích thước cạnh hoặc nhánh của ad
 - diện tích ad theo pixel
-- tỷ lệ phần trăm diện tích ad so với toàn ảnh
+- tỷ lệ phần trăm diện tích ad
+- ảnh output có khoanh vùng ad, hiển thị kích thước và `% diện tích`
 
-Hiện tại script hỗ trợ tốt cho các dạng:
+Hiện tại repo đang dùng workflow theo folder:
 
-- `l`: ad hình chữ L
-- `rectangle`: ad hình chữ nhật
-- `square`: ad hình vuông
+- `input/`: chứa ảnh đầu vào
+- `output/`: chứa ảnh kết quả đã annotate
 
-Repo này đang có sẵn 3 ảnh mẫu:
+## Cấu trúc thư mục
 
-- `sample1.png`: ad màu cam, hình chữ `L`
-- `sample2.png`: ad màu đen, hình chữ `L`
-- `sample3.png`: ad màu đỏ, hình chữ nhật
-
-## File chính
-
-- `detect_ad.py`: script detect ad
-- `sample1.png`, `sample2.png`, `sample3.png`: ảnh mẫu để test
+- `detect_ad.py`: script chính
+- `input/`: folder ảnh đầu vào
+- `output/`: folder ảnh đầu ra
+- `README.md`: hướng dẫn sử dụng
 
 ## Yêu cầu
 
@@ -33,70 +31,112 @@ pip install opencv-python numpy
 
 ## Cách chạy
 
-Lệnh tổng quát:
+### 1. Chạy hàng loạt theo folder
+
+Nếu không truyền `--image`, script sẽ tự động đọc toàn bộ ảnh trong `input/` và ghi kết quả sang `output/`.
 
 ```bash
-python detect_ad.py --image <duong_dan_anh> [--color HEX] [--shape auto|l|square|rectangle] [--tolerance N] [--json]
+python detect_ad.py
 ```
+
+Bạn cũng có thể chỉ định folder khác:
+
+```bash
+python detect_ad.py --input-dir input --output-dir output
+```
+
+### 2. Chạy cho một ảnh
+
+```bash
+python detect_ad.py --image input/sample3.png --shape rectangle
+```
+
+Nếu không truyền `--output`, script sẽ:
+
+- ghi vào `output/<ten_anh>_detected.png` nếu ảnh nằm trong folder `input/`
+- hoặc ghi cạnh file gốc nếu ảnh nằm ở nơi khác
 
 Ví dụ:
 
 ```bash
-python detect_ad.py --image sample1.png
-python detect_ad.py --image sample2.png
-python detect_ad.py --image sample3.png --shape rectangle
-python detect_ad.py --image sample3.png --color BB281A --shape rectangle --json
+python detect_ad.py --image input/sample1.png
+python detect_ad.py --image input/sample3.png --shape rectangle
+python detect_ad.py --image input/sample3.png --shape rectangle --output output/sample3_result.png
+python detect_ad.py --image input/sample3.png --color BB281A --shape rectangle --json
 ```
 
-## Giải thích tham số
+## Tham số
 
-- `--image`: đường dẫn ảnh đầu vào, bắt buộc
+- `--image`: đường dẫn tới 1 ảnh cụ thể
+- `--input-dir`: folder input cho batch mode, mặc định là `input`
+- `--output-dir`: folder output cho batch mode, mặc định là `output`
 - `--color`: màu ad ở dạng hex, ví dụ `#FFA223` hoặc `FFA223`
 - `--shape`: gợi ý shape cho ad
-  - `auto`: script tự suy luận
+  - `auto`: tự suy luận
   - `l`: hình chữ L
   - `rectangle`: hình chữ nhật
   - `square`: hình vuông
 - `--tolerance`: độ lệch màu tối đa khi tạo mask, mặc định là `20`
+- `--output`: đường dẫn ảnh output trong single-image mode
 - `--json`: in kết quả dưới dạng JSON
 
 ## Output
 
-Khi chạy bình thường, script sẽ in ra:
+Script tạo ra 2 loại output:
 
-- đường dẫn ảnh
-- màu detect được
-- shape detect được
-- diện tích ad theo pixel
-- phần trăm diện tích ad
-- bounding box của vùng ad
-- kích thước cạnh hoặc nhánh của ad
+### 1. Kết quả trên terminal
 
-Ví dụ output text:
-
-```bash
-python detect_ad.py --image sample3.png --shape rectangle
-```
+Single-image mode sẽ in chi tiết cho 1 ảnh:
 
 ```text
-Image: sample3.png
+Image: input\sample3.png
 Detected color: #BB281A
 Shape: rectangle
 Ad area: 60370 px (20.403% of the image)
 Bounding box: x=376, y=112, width=331, height=187
+Output image: output\sample3_detected.png
 Width: 331 px
 Height: 187 px
 ```
 
-Ví dụ output JSON:
+Batch mode sẽ in summary cho cả folder:
+
+```text
+Input folder: input
+Output folder: output
+Processed: 4 | Success: 4 | Errors: 0
+```
+
+Sau đó script sẽ in kết quả chi tiết cho từng ảnh.
+
+### 2. Ảnh output đã annotate
+
+Mỗi ảnh output sẽ có:
+
+- vùng ad được tô highlight
+- contour khoanh đúng vùng ad
+- label kích thước cạnh hoặc nhánh
+- `% diện tích` hiển thị bên trong ad
+
+Tên file mặc định:
+
+- `output/sample1_detected.png`
+- `output/sample2_detected.png`
+- `output/sample3_detected.png`
+
+## Output JSON
+
+### Single-image mode
 
 ```bash
-python detect_ad.py --image sample3.png --shape rectangle --json
+python detect_ad.py --image input/sample3.png --shape rectangle --json
 ```
+
+Ví dụ:
 
 ```json
 {
-  "image_path": "sample3.png",
+  "image_path": "input\\sample3.png",
   "detected_color_hex": "#BB281A",
   "shape": "rectangle",
   "inferred_shape": "rectangle",
@@ -114,95 +154,79 @@ python detect_ad.py --image sample3.png --shape rectangle --json
   },
   "tolerance": 20,
   "rectangularity": 0.9753,
-  "selection_score": 131324.671
+  "selection_score": 58880.671,
+  "output_image_path": "output\\sample3_detected.png"
 }
 ```
 
-## Kết quả trên 3 ảnh mẫu
-
-### sample1.png
+### Batch mode
 
 ```bash
-python detect_ad.py --image sample1.png
+python detect_ad.py --json
 ```
 
-Kết quả:
+Batch mode trả về object gồm:
 
-- màu detect: `#FEA11E`
-- shape: `l`
-- góc: `bottom-left`
-- nhánh trái: `435 x 1079 px`
-- nhánh dưới: `1919 x 244 px`
-- diện tích: `831461 px`
-- tỷ lệ diện tích: `40.156%`
+- `input_dir`
+- `output_dir`
+- `processed_count`
+- `success_count`
+- `error_count`
+- `results`: danh sách kết quả thành công
+- `errors`: danh sách ảnh bị lỗi nếu có
 
-### sample2.png
+## Kết quả hiện tại trên folder input
+
+Chạy:
 
 ```bash
-python detect_ad.py --image sample2.png
+python detect_ad.py
 ```
 
-Kết quả:
+Kết quả đang detect được:
 
-- màu detect: `#000000`
-- shape: `l`
-- góc: `bottom-left`
-- nhánh trái: `534 x 1079 px`
-- nhánh dưới: `1919 x 299 px`
-- diện tích: `990293 px`
-- tỷ lệ diện tích: `47.826%`
-
-### sample3.png
-
-```bash
-python detect_ad.py --image sample3.png --shape rectangle
-```
-
-Kết quả:
-
-- màu detect: `#BB281A`
-- shape: `rectangle`
-- width: `331 px`
-- height: `187 px`
-- diện tích: `60370 px`
-- tỷ lệ diện tích: `20.403%`
+- `input/sample1.png`: `l`, màu `#FEA11E`, diện tích `40.156%`
+- `input/sample2.png`: `l`, màu `#000000`, diện tích `47.826%`
+- `input/sample3.png`: `rectangle`, màu `#BB281A`, diện tích `20.403%`
+- `input/test.png`: `rectangle`, màu `#FFA327`, diện tích `18.388%`
 
 ## Cách script hoạt động
 
 Script làm việc theo hướng đơn giản và thực dụng:
 
 1. Đọc ảnh đầu vào.
-2. Nếu không có `--color`, script sẽ lấy các màu nổi bật từ:
+2. Nếu không có `--color`, script lấy các màu nổi bật từ:
    - viền ảnh
    - toàn bộ ảnh
-3. Tạo mask cho từng màu candidate dựa trên khoảng cách màu RGB.
+3. Tạo mask cho từng màu candidate dựa trên khoảng cách RGB.
 4. Tách các connected component.
 5. Chấm điểm từng component theo:
    - diện tích
    - độ giống `L`
    - độ giống `rectangle/square`
    - shape hint nếu bạn truyền `--shape`
-6. Chọn component tốt nhất và in kết quả.
+6. Chọn component tốt nhất.
+7. Sinh ảnh output với contour, nhãn kích thước và `% diện tích`.
 
 ## Lưu ý
 
 - Script phù hợp nhất khi ad là một vùng đơn sắc rõ ràng.
 - Nếu ảnh có nhiều vùng cùng màu hoặc nền quá giống màu ad, nên truyền thêm `--color`.
 - Nếu bạn đã biết shape, nên truyền thêm `--shape` để kết quả ổn định hơn.
-- Nếu detect bị dư hoặc thiếu mép, hãy thử tăng/giảm `--tolerance`.
+- Nếu detect bị dư hoặc thiếu mép, hãy thử tăng hoặc giảm `--tolerance`.
+- Batch mode sẽ tự bỏ qua các file đã annotate có hậu tố `_detected`.
 
 Ví dụ:
 
 ```bash
-python detect_ad.py --image sample3.png --color BB281A --shape rectangle --tolerance 15
+python detect_ad.py --image input/sample3.png --color BB281A --shape rectangle --tolerance 15
 ```
 
 ## Hướng mở rộng
 
 Có thể làm tiếp các phần sau nếu cần:
 
-- xuất ảnh có vẽ bounding box
-- xuất mask của ad
+- xuất thêm mask riêng của ad
 - xử lý nhiều ad trong một ảnh
-- batch processing cho cả folder
+- batch processing đệ quy qua subfolder
 - thêm unit test cho các sample

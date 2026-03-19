@@ -12,6 +12,9 @@ DEFAULT_BIN_SIZE = 16
 DEFAULT_TOP_K_COLORS = 8
 EDGE_COVERAGE_THRESHOLD = 0.9
 MIN_EDGE_RATIO = 0.01
+DEFAULT_INPUT_DIR = "input"
+DEFAULT_OUTPUT_DIR = "output"
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def parse_args():
@@ -20,8 +23,17 @@ def parse_args():
     )
     parser.add_argument(
         "--image",
-        required=True,
-        help="Path to the input image.",
+        help="Path to a single input image. If omitted, the script processes the whole input folder.",
+    )
+    parser.add_argument(
+        "--input-dir",
+        default=DEFAULT_INPUT_DIR,
+        help=f"Input folder for batch processing. Default: {DEFAULT_INPUT_DIR}",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Output folder for batch processing. Default: {DEFAULT_OUTPUT_DIR}",
     )
     parser.add_argument(
         "--color",
@@ -43,6 +55,10 @@ def parse_args():
         "--json",
         action="store_true",
         help="Print the result as JSON.",
+    )
+    parser.add_argument(
+        "--output",
+        help="Optional path for the annotated output image in single-image mode.",
     )
     return parser.parse_args()
 
@@ -380,6 +396,336 @@ def build_dimensions(shape_name, bbox, edges, edge_pair):
     }
 
 
+def default_output_path(image_path, input_dir=None, output_dir=None):
+    resolved_input_dir = Path(input_dir) if input_dir is not None else Path(DEFAULT_INPUT_DIR)
+    resolved_output_dir = Path(output_dir) if output_dir is not None else Path(DEFAULT_OUTPUT_DIR)
+    if image_path.parent.resolve() == resolved_input_dir.resolve():
+        return resolved_output_dir / f"{image_path.stem}_detected.png"
+    return image_path.with_name(f"{image_path.stem}_detected.png")
+
+
+def default_batch_output_path(image_path, output_dir):
+    return output_dir / f"{image_path.stem}_detected.png"
+
+
+def is_supported_image_file(path):
+    return (
+        path.is_file()
+        and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        and not path.stem.endswith("_detected")
+    )
+
+
+def find_input_images(input_dir):
+    return sorted(path for path in input_dir.iterdir() if is_supported_image_file(path))
+
+
+def choose_annotation_color(ad_color_rgb):
+    candidate_colors_rgb = [
+        (0, 255, 255),
+        (255, 255, 0),
+        (255, 0, 255),
+        (0, 255, 0),
+        (255, 255, 255),
+    ]
+    ad_color = np.array(ad_color_rgb, dtype=np.int32)
+    chosen_rgb = max(
+        candidate_colors_rgb,
+        key=lambda color: np.sum((np.array(color, dtype=np.int32) - ad_color) ** 2),
+    )
+    return (chosen_rgb[2], chosen_rgb[1], chosen_rgb[0])
+
+
+def fit_text_scale(text, max_width, max_height, thickness=2, min_scale=0.35, max_scale=1.2):
+    max_width = max(1, int(max_width))
+    max_height = max(1, int(max_height))
+    (base_width, base_height), base_baseline = cv2.getTextSize(
+        text,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        thickness,
+    )
+    base_height += base_baseline
+
+    width_scale = max_width / float(max(base_width, 1))
+    height_scale = max_height / float(max(base_height, 1))
+    return max(min_scale, min(max_scale, width_scale, height_scale))
+
+
+def clamp(value, min_value, max_value):
+    return max(min_value, min(value, max_value))
+
+
+def draw_text_box(
+    image_bgr,
+    text,
+    center,
+    max_width,
+    max_height,
+    border_color_bgr,
+    background_color_bgr=(20, 20, 20),
+    text_color_bgr=(255, 255, 255),
+):
+    scale = fit_text_scale(text, max_width=max_width, max_height=max_height)
+    thickness = max(1, int(round(scale * 2)))
+    (text_width, text_height), baseline = cv2.getTextSize(
+        text,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        thickness,
+    )
+    padding = max(4, int(round(scale * 8)))
+
+    text_x = int(round(center[0] - text_width / 2.0))
+    text_y = int(round(center[1] + text_height / 2.0))
+
+    box_left = clamp(text_x - padding, 0, max(0, image_bgr.shape[1] - (text_width + padding * 2)))
+    box_top = clamp(text_y - text_height - padding, 0, max(0, image_bgr.shape[0] - (text_height + baseline + padding * 2)))
+    box_right = box_left + text_width + padding * 2
+    box_bottom = box_top + text_height + baseline + padding * 2
+
+    text_x = box_left + padding
+    text_y = box_top + padding + text_height
+
+    cv2.rectangle(
+        image_bgr,
+        (box_left, box_top),
+        (box_right, box_bottom),
+        background_color_bgr,
+        thickness=-1,
+    )
+    cv2.rectangle(
+        image_bgr,
+        (box_left, box_top),
+        (box_right, box_bottom),
+        border_color_bgr,
+        thickness=2,
+    )
+    cv2.putText(
+        image_bgr,
+        text,
+        (text_x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        text_color_bgr,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def draw_measurement_line(image_bgr, start_point, end_point, color_bgr):
+    cv2.line(image_bgr, start_point, end_point, color_bgr, thickness=2, lineType=cv2.LINE_AA)
+
+    tick_size = 7
+    if start_point[1] == end_point[1]:
+        for point in (start_point, end_point):
+            cv2.line(
+                image_bgr,
+                (point[0], point[1] - tick_size),
+                (point[0], point[1] + tick_size),
+                color_bgr,
+                thickness=2,
+                lineType=cv2.LINE_AA,
+            )
+    else:
+        for point in (start_point, end_point):
+            cv2.line(
+                image_bgr,
+                (point[0] - tick_size, point[1]),
+                (point[0] + tick_size, point[1]),
+                color_bgr,
+                thickness=2,
+                lineType=cv2.LINE_AA,
+            )
+
+
+def apply_mask_overlay(image_bgr, component_mask, color_bgr, alpha=0.28):
+    color_array = np.array(color_bgr, dtype=np.float32)
+    mask = component_mask.astype(bool)
+    image_bgr[mask] = (
+        image_bgr[mask].astype(np.float32) * (1.0 - alpha) + color_array * alpha
+    ).astype(np.uint8)
+
+
+def draw_component_contours(image_bgr, component_mask, color_bgr):
+    contour_mask = (component_mask.astype(np.uint8)) * 255
+    contours, _ = cv2.findContours(contour_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(image_bgr, contours, -1, color_bgr, thickness=3, lineType=cv2.LINE_AA)
+
+
+def best_label_center(component_mask):
+    mask_uint8 = (component_mask.astype(np.uint8)) * 255
+    distance_map = cv2.distanceTransform(mask_uint8, cv2.DIST_L2, 5)
+    _, _, _, max_location = cv2.minMaxLoc(distance_map)
+    return max_location
+
+
+def draw_area_label(image_bgr, component_mask, bbox, area_percent, border_color_bgr, shape_name):
+    if shape_name in ("rectangle", "square"):
+        center_x = bbox["x"] + bbox["width"] // 2
+        center_y = bbox["y"] + bbox["height"] // 2
+    else:
+        center_x, center_y = best_label_center(component_mask)
+
+    text = f"{area_percent:.3f}%"
+    max_width = max(100, int(round(bbox["width"] * 0.45)))
+    max_height = max(36, int(round(bbox["height"] * 0.22)))
+    draw_text_box(
+        image_bgr=image_bgr,
+        text=text,
+        center=(center_x, center_y),
+        max_width=max_width,
+        max_height=max_height,
+        border_color_bgr=border_color_bgr,
+    )
+
+
+def draw_rectangle_dimensions(image_bgr, bbox, border_color_bgr):
+    x = bbox["x"]
+    y = bbox["y"]
+    width = bbox["width"]
+    height = bbox["height"]
+    image_height, image_width = image_bgr.shape[:2]
+    offset = max(18, int(round(min(image_width, image_height) * 0.03)))
+
+    width_line_y = y - offset if y - offset >= 20 else min(image_height - 20, y + offset)
+    height_line_x = x - offset if x - offset >= 20 else min(image_width - 20, x + offset)
+
+    draw_measurement_line(
+        image_bgr,
+        start_point=(x, width_line_y),
+        end_point=(x + width, width_line_y),
+        color_bgr=border_color_bgr,
+    )
+    draw_text_box(
+        image_bgr=image_bgr,
+        text=f"W: {width} px",
+        center=(x + width // 2, width_line_y - 18 if width_line_y <= y else width_line_y + 18),
+        max_width=max(100, int(round(width * 0.8))),
+        max_height=40,
+        border_color_bgr=border_color_bgr,
+    )
+
+    draw_measurement_line(
+        image_bgr,
+        start_point=(height_line_x, y),
+        end_point=(height_line_x, y + height),
+        color_bgr=border_color_bgr,
+    )
+    draw_text_box(
+        image_bgr=image_bgr,
+        text=f"H: {height} px",
+        center=(
+            height_line_x - 85 if height_line_x <= x else height_line_x + 85,
+            y + height // 2,
+        ),
+        max_width=180,
+        max_height=max(40, int(round(height * 0.4))),
+        border_color_bgr=border_color_bgr,
+    )
+
+
+def draw_l_dimensions(image_bgr, bbox, edge_pair, dimensions, border_color_bgr):
+    if edge_pair is None:
+        vertical_edge = "left" if "left_arm" in dimensions else "right"
+        horizontal_edge = "top" if "top_arm" in dimensions else "bottom"
+    else:
+        vertical_edge, horizontal_edge = normalize_l_pair(edge_pair)
+    image_height, image_width = image_bgr.shape[:2]
+
+    vertical_width = dimensions[f"{vertical_edge}_arm"]["width_px"]
+    vertical_height = dimensions[f"{vertical_edge}_arm"]["height_px"]
+    horizontal_width = dimensions[f"{horizontal_edge}_arm"]["width_px"]
+    horizontal_height = dimensions[f"{horizontal_edge}_arm"]["height_px"]
+
+    y_line = bbox["y"] + bbox["height"] // 2
+    if vertical_edge == "left":
+        x_start = bbox["x"]
+        x_end = bbox["x"] + vertical_width
+    else:
+        x_start = bbox["x"] + bbox["width"] - vertical_width
+        x_end = bbox["x"] + bbox["width"]
+
+    draw_measurement_line(
+        image_bgr,
+        start_point=(x_start, y_line),
+        end_point=(x_end, y_line),
+        color_bgr=border_color_bgr,
+    )
+    draw_text_box(
+        image_bgr=image_bgr,
+        text=f"{vertical_edge.title()} arm: {vertical_width} x {vertical_height} px",
+        center=(
+            (x_start + x_end) // 2,
+            clamp(y_line - 24, 24, image_height - 24),
+        ),
+        max_width=max(120, min(int(round(image_width * 0.55)), bbox["width"])),
+        max_height=42,
+        border_color_bgr=border_color_bgr,
+    )
+
+    x_line = bbox["x"] + bbox["width"] // 2
+    if horizontal_edge == "top":
+        y_start = bbox["y"]
+        y_end = bbox["y"] + horizontal_height
+    else:
+        y_start = bbox["y"] + bbox["height"] - horizontal_height
+        y_end = bbox["y"] + bbox["height"]
+
+    draw_measurement_line(
+        image_bgr,
+        start_point=(x_line, y_start),
+        end_point=(x_line, y_end),
+        color_bgr=border_color_bgr,
+    )
+    draw_text_box(
+        image_bgr=image_bgr,
+        text=f"{horizontal_edge.title()} arm: {horizontal_width} x {horizontal_height} px",
+        center=(
+            clamp(x_line + 150, 100, image_width - 100),
+            (y_start + y_end) // 2,
+        ),
+        max_width=max(120, min(int(round(image_width * 0.6)), bbox["width"])),
+        max_height=42,
+        border_color_bgr=border_color_bgr,
+    )
+
+
+def save_annotated_image(image_rgb, component_mask, result, edge_pair, output_path):
+    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    border_color_bgr = choose_annotation_color(parse_hex_color(result["detected_color_hex"]))
+
+    apply_mask_overlay(image_bgr, component_mask, color_bgr=border_color_bgr)
+    draw_component_contours(image_bgr, component_mask, color_bgr=border_color_bgr)
+
+    if result["shape"] == "l":
+        draw_l_dimensions(
+            image_bgr=image_bgr,
+            bbox=result["bbox"],
+            edge_pair=edge_pair,
+            dimensions=result["dimensions"],
+            border_color_bgr=border_color_bgr,
+        )
+    else:
+        draw_rectangle_dimensions(
+            image_bgr=image_bgr,
+            bbox=result["bbox"],
+            border_color_bgr=border_color_bgr,
+        )
+
+    draw_area_label(
+        image_bgr=image_bgr,
+        component_mask=component_mask,
+        bbox=result["bbox"],
+        area_percent=result["area_percent"],
+        border_color_bgr=border_color_bgr,
+        shape_name=result["shape"],
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), image_bgr)
+
+
 def detect_ad(image_path, color_hint, shape_hint, tolerance):
     image_rgb = load_image_rgb(image_path)
     image_width = image_rgb.shape[1]
@@ -405,6 +751,7 @@ def detect_ad(image_path, color_hint, shape_hint, tolerance):
     label = best_component["label"]
     stats = best_component["stats"]
     x, y, width, height, area_pixels = stats[label]
+    component_mask = best_component["labels"] == label
     inferred_shape = best_component["inferred_shape"]
     edges = best_component["edges"]
     edge_pair = best_component["edge_pair"]
@@ -437,7 +784,12 @@ def detect_ad(image_path, color_hint, shape_hint, tolerance):
             f"Shape hint '{shape_hint}' differs from inferred shape '{inferred_shape}'."
         )
 
-    return result
+    render_data = {
+        "image_rgb": image_rgb,
+        "component_mask": component_mask,
+        "edge_pair": edge_pair,
+    }
+    return result, render_data
 
 
 def print_human_readable(result):
@@ -454,6 +806,7 @@ def print_human_readable(result):
         f"x={result['bbox']['x']}, y={result['bbox']['y']}, "
         f"width={result['bbox']['width']}, height={result['bbox']['height']}"
     )
+    print(f"Output image: {result['output_image_path']}")
 
     dimensions = result["dimensions"]
     if result["shape"] == "l":
@@ -474,20 +827,133 @@ def print_human_readable(result):
         print(f"Warning: {result['warning']}")
 
 
+def process_single_image(image_path, color_hint, shape_hint, tolerance, output_path):
+    result, render_data = detect_ad(
+        image_path=image_path,
+        color_hint=color_hint,
+        shape_hint=shape_hint,
+        tolerance=tolerance,
+    )
+    save_annotated_image(
+        image_rgb=render_data["image_rgb"],
+        component_mask=render_data["component_mask"],
+        result=result,
+        edge_pair=render_data["edge_pair"],
+        output_path=output_path,
+    )
+    result["output_image_path"] = str(output_path)
+    return result
+
+
+def process_image_directory(input_dir, output_dir, color_hint, shape_hint, tolerance):
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
+    if not input_dir.is_dir():
+        raise NotADirectoryError(f"Input path is not a folder: {input_dir}")
+
+    image_paths = find_input_images(input_dir)
+    summary = {
+        "input_dir": str(input_dir),
+        "output_dir": str(output_dir),
+        "processed_count": len(image_paths),
+        "success_count": 0,
+        "error_count": 0,
+        "results": [],
+        "errors": [],
+    }
+
+    for image_path in image_paths:
+        output_path = default_batch_output_path(image_path, output_dir)
+        try:
+            result = process_single_image(
+                image_path=image_path,
+                color_hint=color_hint,
+                shape_hint=shape_hint,
+                tolerance=tolerance,
+                output_path=output_path,
+            )
+            summary["results"].append(result)
+            summary["success_count"] += 1
+        except Exception as exc:
+            summary["errors"].append(
+                {
+                    "image_path": str(image_path),
+                    "error": str(exc),
+                }
+            )
+            summary["error_count"] += 1
+
+    return summary
+
+
+def print_batch_human_readable(summary):
+    print(f"Input folder: {summary['input_dir']}")
+    print(f"Output folder: {summary['output_dir']}")
+    print(
+        "Processed: "
+        f"{summary['processed_count']} | "
+        f"Success: {summary['success_count']} | "
+        f"Errors: {summary['error_count']}"
+    )
+
+    if not summary["results"] and not summary["errors"]:
+        print("No supported image files found.")
+        return
+
+    for index, result in enumerate(summary["results"], start=1):
+        print()
+        print(f"--- Result {index} ---")
+        print_human_readable(result)
+
+    for index, error_info in enumerate(summary["errors"], start=1):
+        print()
+        print(f"--- Error {index} ---")
+        print(f"Image: {error_info['image_path']}")
+        print(f"Error: {error_info['error']}")
+
+
 def main():
     args = parse_args()
-    image_path = Path(args.image)
-    result = detect_ad(
-        image_path=image_path,
+    if args.image:
+        image_path = Path(args.image)
+        output_path = (
+            Path(args.output)
+            if args.output
+            else default_output_path(
+                image_path=image_path,
+                input_dir=args.input_dir,
+                output_dir=args.output_dir,
+            )
+        )
+        result = process_single_image(
+            image_path=image_path,
+            color_hint=args.color,
+            shape_hint=args.shape,
+            tolerance=args.tolerance,
+            output_path=output_path,
+        )
+
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print_human_readable(result)
+        return
+
+    if args.output:
+        raise ValueError("--output can only be used together with --image.")
+
+    summary = process_image_directory(
+        input_dir=Path(args.input_dir),
+        output_dir=Path(args.output_dir),
         color_hint=args.color,
         shape_hint=args.shape,
         tolerance=args.tolerance,
     )
 
     if args.json:
-        print(json.dumps(result, indent=2))
+        print(json.dumps(summary, indent=2))
     else:
-        print_human_readable(result)
+        print_batch_human_readable(summary)
 
 
 if __name__ == "__main__":
