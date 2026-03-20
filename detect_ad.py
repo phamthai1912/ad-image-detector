@@ -15,8 +15,24 @@ MIN_EDGE_RATIO = 0.01
 DEFAULT_INPUT_DIR = "input"
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_FRAME_INTERVAL_SECONDS = 2.0
+WARNING_MIN_FRAMES = 3
+WARNING_STABLE_GROUP_MIN_FRAMES = 5
+WARNING_AREA_RELATIVE_TOLERANCE = 0.03
+WARNING_AREA_ABSOLUTE_TOLERANCE_PIXELS = 500
+WARNING_DIMENSION_RELATIVE_TOLERANCE = 0.03
+WARNING_DIMENSION_ABSOLUTE_TOLERANCE_PX = 6
+MIN_L_PAIR_SCORE = 0.35
+MIN_RECTANGULARITY_FOR_RECT = 0.9
+FULL_FRAME_AD_THRESHOLD_PERCENT = 99.5
+MIN_AD_AREA_PERCENT = 5.0
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+
+
+class NoAdsDetectedError(RuntimeError):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def parse_args():
@@ -216,13 +232,16 @@ def infer_shape_from_component(component_crop, bbox_width, bbox_height, area_pix
     else:
         best_pair_score = 0.0
 
-    if rectangularity < 0.9 and best_pair:
+    if rectangularity < MIN_RECTANGULARITY_FOR_RECT and best_pair and best_pair_score >= MIN_L_PAIR_SCORE:
         return "l", edges, best_pair, rectangularity, best_pair_score
 
-    if aspect_gap <= 0.05:
+    if rectangularity >= MIN_RECTANGULARITY_FOR_RECT and aspect_gap <= 0.05:
         return "square", edges, best_pair, rectangularity, best_pair_score
 
-    return "rectangle", edges, best_pair, rectangularity, best_pair_score
+    if rectangularity >= MIN_RECTANGULARITY_FOR_RECT:
+        return "rectangle", edges, best_pair, rectangularity, best_pair_score
+
+    return "unknown", edges, best_pair, rectangularity, best_pair_score
 
 
 def compute_component_score(
@@ -259,6 +278,8 @@ def compute_component_score(
             shape_score = rectangle_like + 0.75
         else:
             shape_score = rectangle_like * 0.25
+    elif inferred_shape == "unknown":
+        shape_score = 0.0
     else:
         shape_score = max(rectangularity, best_pair_score)
         if inferred_shape == "l":
@@ -290,6 +311,8 @@ def select_best_component(image_rgb, candidate_colors, tolerance, shape_hint):
                     area_pixels=area,
                 )
             )
+            if inferred_shape == "unknown":
+                continue
             score = compute_component_score(
                 area_pixels=area,
                 inferred_shape=inferred_shape,
@@ -404,6 +427,34 @@ def detection_output_path(image_path, output_dir):
     return output_dir / f"{image_path.stem}_detected.png"
 
 
+def warning_output_path(output_path):
+    stem = output_path.stem.removesuffix("_detected")
+    return output_path.with_name(f"{stem}_warning{output_path.suffix}")
+
+
+def no_ad_output_path(image_path, output_dir):
+    return output_dir / f"{image_path.stem}_no_ad.png"
+
+
+def output_variant_paths(image_path, output_dir):
+    detected_path = detection_output_path(image_path, output_dir)
+    return [
+        detected_path,
+        warning_output_path(detected_path),
+        no_ad_output_path(image_path, output_dir),
+        detected_path.with_name(f"{detected_path.stem}_warning{detected_path.suffix}"),
+    ]
+
+
+def cleanup_output_variants(image_path, output_dir, keep_path=None):
+    keep_resolved = keep_path.resolve() if keep_path is not None else None
+    for candidate_path in output_variant_paths(image_path, output_dir):
+        if keep_resolved is not None and candidate_path.resolve() == keep_resolved:
+            continue
+        if candidate_path.exists():
+            candidate_path.unlink()
+
+
 def is_supported_image_file(path):
     return (
         path.is_file()
@@ -475,6 +526,261 @@ def extract_frames_from_video(video_path, frames_dir, frame_interval_seconds):
         raise RuntimeError(f"No frames extracted from video: {video_path}")
 
     return extracted_frames
+
+
+def numeric_median(values):
+    if not values:
+        return 0
+    return float(np.median(np.array(values, dtype=np.float64)))
+
+
+def dimension_metric_values(result):
+    metrics = {}
+    dimensions = result["dimensions"]
+    if result["shape"] == "l":
+        metrics["corner"] = dimensions["corner"]
+        for arm_name, arm_size in dimensions.items():
+            if arm_name == "corner":
+                continue
+            metrics[f"{arm_name}_width_px"] = arm_size["width_px"]
+            metrics[f"{arm_name}_height_px"] = arm_size["height_px"]
+        return metrics
+
+    metrics["width_px"] = dimensions["width_px"]
+    metrics["height_px"] = dimensions["height_px"]
+    return metrics
+
+
+def dominant_value(values):
+    counts = Counter(values)
+    return counts.most_common(1)[0][0]
+
+
+def build_video_warning_reference(results):
+    if len(results) < WARNING_MIN_FRAMES:
+        return None
+
+    dominant_shape = dominant_value([result["shape"] for result in results])
+    dominant_shape_results = [result for result in results if result["shape"] == dominant_shape]
+    if len(dominant_shape_results) < 2:
+        return None
+
+    reference = {
+        "shape": dominant_shape,
+        "area_pixels": numeric_median([result["area_pixels"] for result in dominant_shape_results]),
+        "metrics": {},
+    }
+
+    metric_maps = [dimension_metric_values(result) for result in dominant_shape_results]
+    metric_keys = set(metric_maps[0].keys())
+    for metric_map in metric_maps[1:]:
+        metric_keys &= set(metric_map.keys())
+
+    for metric_key in sorted(metric_keys):
+        values = [metric_map[metric_key] for metric_map in metric_maps]
+        if isinstance(values[0], str):
+            reference["metrics"][metric_key] = dominant_value(values)
+        else:
+            reference["metrics"][metric_key] = numeric_median(values)
+
+    return reference
+
+
+def build_warning_reference_from_results(results):
+    if not results:
+        return None
+
+    reference = {
+        "shape": dominant_value([result["shape"] for result in results]),
+        "area_pixels": numeric_median([result["area_pixels"] for result in results]),
+        "area_percent": numeric_median([result["area_percent"] for result in results]),
+        "frame_count": len(results),
+        "metrics": {},
+    }
+
+    metric_maps = [dimension_metric_values(result) for result in results]
+    metric_keys = set(metric_maps[0].keys())
+    for metric_map in metric_maps[1:]:
+        metric_keys &= set(metric_map.keys())
+
+    for metric_key in sorted(metric_keys):
+        values = [metric_map[metric_key] for metric_map in metric_maps]
+        if isinstance(values[0], str):
+            reference["metrics"][metric_key] = dominant_value(values)
+        else:
+            reference["metrics"][metric_key] = numeric_median(values)
+
+    return reference
+
+
+def area_matches_reference(area_pixels, baseline_pixels):
+    return not numeric_difference_exceeds_tolerance(
+        value=area_pixels,
+        baseline=baseline_pixels,
+        absolute_tolerance=WARNING_AREA_ABSOLUTE_TOLERANCE_PIXELS,
+        relative_tolerance=WARNING_AREA_RELATIVE_TOLERANCE,
+    )
+
+
+def cluster_results_by_area(results):
+    clusters = []
+
+    for result in sorted(results, key=lambda item: (item["shape"], item["area_pixels"])):
+        matched_cluster = None
+        for cluster in clusters:
+            if cluster["shape"] != result["shape"]:
+                continue
+            if area_matches_reference(result["area_pixels"], cluster["area_pixels"]):
+                matched_cluster = cluster
+                break
+
+        if matched_cluster is None:
+            matched_cluster = {
+                "shape": result["shape"],
+                "area_pixels": result["area_pixels"],
+                "results": [],
+            }
+            clusters.append(matched_cluster)
+
+        matched_cluster["results"].append(result)
+        matched_cluster["area_pixels"] = numeric_median(
+            [item["area_pixels"] for item in matched_cluster["results"]]
+        )
+
+    return clusters
+
+
+def build_stable_warning_references(results):
+    if len(results) < WARNING_MIN_FRAMES:
+        return []
+
+    stable_references = []
+    for cluster in cluster_results_by_area(results):
+        if len(cluster["results"]) < WARNING_STABLE_GROUP_MIN_FRAMES:
+            continue
+        reference = build_warning_reference_from_results(cluster["results"])
+        if reference is not None:
+            stable_references.append(reference)
+
+    return stable_references
+
+
+def match_warning_reference(result, references):
+    matched_reference = None
+    best_distance = None
+
+    for reference in references:
+        if result["shape"] != reference["shape"]:
+            continue
+        if not area_matches_reference(result["area_pixels"], reference["area_pixels"]):
+            continue
+
+        distance = abs(result["area_pixels"] - reference["area_pixels"])
+        if matched_reference is None or distance < best_distance:
+            matched_reference = reference
+            best_distance = distance
+
+    return matched_reference
+
+
+def numeric_difference_exceeds_tolerance(value, baseline, absolute_tolerance, relative_tolerance):
+    tolerance = max(absolute_tolerance, abs(baseline) * relative_tolerance)
+    return abs(value - baseline) > tolerance
+
+
+def warning_reasons_for_result(result, reference):
+    if reference is None:
+        return []
+
+    reasons = []
+    if result["shape"] != reference["shape"]:
+        reasons.append(
+            f"shape khac voi da so frame ({result['shape']} vs {reference['shape']})"
+        )
+        return reasons
+
+    if numeric_difference_exceeds_tolerance(
+        value=result["area_pixels"],
+        baseline=reference["area_pixels"],
+        absolute_tolerance=WARNING_AREA_ABSOLUTE_TOLERANCE_PIXELS,
+        relative_tolerance=WARNING_AREA_RELATIVE_TOLERANCE,
+    ):
+        reasons.append(
+            f"dien tich khac biet ({result['area_pixels']} px vs median {int(round(reference['area_pixels']))} px)"
+        )
+
+    metric_values = dimension_metric_values(result)
+    for metric_name, baseline_value in reference["metrics"].items():
+        current_value = metric_values.get(metric_name)
+        if current_value is None:
+            continue
+
+        if isinstance(baseline_value, str):
+            if current_value != baseline_value:
+                reasons.append(
+                    f"{metric_name} khac biet ({current_value} vs {baseline_value})"
+                )
+            continue
+
+        if numeric_difference_exceeds_tolerance(
+            value=current_value,
+            baseline=baseline_value,
+            absolute_tolerance=WARNING_DIMENSION_ABSOLUTE_TOLERANCE_PX,
+            relative_tolerance=WARNING_DIMENSION_RELATIVE_TOLERANCE,
+        ):
+            reasons.append(
+                f"{metric_name} khac biet ({current_value} px vs median {int(round(baseline_value))} px)"
+            )
+
+    return reasons
+
+
+def warning_reasons_without_matching_group(result, stable_references):
+    if not stable_references:
+        return []
+
+    candidate_shapes = sorted({reference["shape"] for reference in stable_references})
+    shape_text = ", ".join(candidate_shapes)
+    return [
+        "khong thuoc nhom on dinh co it nhat "
+        f"{WARNING_STABLE_GROUP_MIN_FRAMES} frame cung ty le dien tich "
+        f"(cac nhom hien co: {shape_text})"
+    ]
+
+
+def apply_video_frame_warnings(video_summary):
+    stable_references = build_stable_warning_references(video_summary["results"])
+    reference = None if stable_references else build_video_warning_reference(video_summary["results"])
+    video_summary["warning_count"] = 0
+    video_summary["warning_reference"] = reference
+    video_summary["warning_reference_groups"] = stable_references
+
+    for result in video_summary["results"]:
+        matched_reference = match_warning_reference(result, stable_references)
+        if matched_reference is not None:
+            reasons = warning_reasons_for_result(result, matched_reference)
+        elif stable_references:
+            reasons = warning_reasons_without_matching_group(result, stable_references)
+        else:
+            reasons = warning_reasons_for_result(result, reference)
+        result["warning_reasons"] = reasons
+        result["is_warning"] = len(reasons) > 0
+
+        current_output_path = Path(result["output_image_path"])
+        flagged_output_path = warning_output_path(current_output_path)
+
+        if result["is_warning"]:
+            if current_output_path.exists():
+                if flagged_output_path.exists():
+                    flagged_output_path.unlink()
+                current_output_path.replace(flagged_output_path)
+            result["output_image_path"] = str(flagged_output_path)
+            video_summary["warning_count"] += 1
+        else:
+            if flagged_output_path.exists():
+                flagged_output_path.unlink()
+
+    return video_summary
 
 
 def choose_annotation_color(ad_color_rgb):
@@ -635,6 +941,25 @@ def draw_area_label(image_bgr, component_mask, bbox, area_percent, border_color_
         max_height=max_height,
         border_color_bgr=border_color_bgr,
     )
+
+
+def save_no_ad_image(image_path, output_path):
+    image_rgb = load_image_rgb(image_path)
+    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    image_height, image_width = image_bgr.shape[:2]
+
+    draw_text_box(
+        image_bgr=image_bgr,
+        text="No ads dection",
+        center=(image_width // 2, max(32, image_height // 2)),
+        max_width=max(180, int(round(image_width * 0.7))),
+        max_height=max(40, int(round(image_height * 0.18))),
+        border_color_bgr=(0, 0, 255),
+        background_color_bgr=(32, 32, 32),
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), image_bgr)
 
 
 def draw_rectangle_dimensions(image_bgr, bbox, border_color_bgr):
@@ -800,9 +1125,8 @@ def detect_ad(image_path, color_hint, shape_hint, tolerance):
         shape_hint=shape_hint,
     )
     if best_component is None:
-        raise RuntimeError(
-            "Cannot find a single-color ad region. "
-            "Try passing --color to help the detector."
+        raise NoAdsDetectedError(
+            "No ads dection: detected region is not a supported shape."
         )
 
     label = best_component["label"]
@@ -822,6 +1146,14 @@ def detect_ad(image_path, color_hint, shape_hint, tolerance):
         "height": int(height),
     }
     area_percent = float(area_pixels) / float(image_width * image_height) * 100.0
+    if area_percent < MIN_AD_AREA_PERCENT:
+        raise NoAdsDetectedError(
+            f"No ads dection: detected ad area is below {MIN_AD_AREA_PERCENT:.0f}% of the frame."
+        )
+    if area_percent >= FULL_FRAME_AD_THRESHOLD_PERCENT:
+        raise NoAdsDetectedError(
+            "No ads dection: detected ad covers the whole frame."
+        )
     result = {
         "image_path": str(image_path),
         "detected_color_hex": rgb_to_hex(best_component["color_rgb"]),
@@ -880,11 +1212,20 @@ def print_human_readable(result):
         print(f"Width: {dimensions['width_px']} px")
         print(f"Height: {dimensions['height_px']} px")
 
+    if result.get("warning_reasons"):
+        for reason in result["warning_reasons"]:
+            print(f"Warning detail: {reason}")
+
     if "warning" in result:
         print(f"Warning: {result['warning']}")
 
 
 def process_single_image(image_path, color_hint, shape_hint, tolerance, output_path):
+    cleanup_output_variants(
+        image_path=image_path,
+        output_dir=output_path.parent,
+        keep_path=output_path,
+    )
     result, render_data = detect_ad(
         image_path=image_path,
         color_hint=color_hint,
@@ -915,8 +1256,10 @@ def process_image_directory(source_dir, output_dir, color_hint, shape_hint, tole
         "output_dir": str(output_dir),
         "processed_count": len(image_paths),
         "success_count": 0,
+        "no_detection_count": 0,
         "error_count": 0,
         "results": [],
+        "no_detections": [],
         "errors": [],
     }
 
@@ -932,6 +1275,23 @@ def process_image_directory(source_dir, output_dir, color_hint, shape_hint, tole
             )
             summary["results"].append(result)
             summary["success_count"] += 1
+        except NoAdsDetectedError as exc:
+            no_ad_path = no_ad_output_path(image_path, output_dir)
+            cleanup_output_variants(
+                image_path=image_path,
+                output_dir=output_dir,
+                keep_path=no_ad_path,
+            )
+            save_no_ad_image(image_path=image_path, output_path=no_ad_path)
+            summary["no_detections"].append(
+                {
+                    "image_path": str(image_path),
+                    "report": "No ads dection",
+                    "reason": exc.reason,
+                    "output_image_path": str(no_ad_path),
+                }
+            )
+            summary["no_detection_count"] += 1
         except Exception as exc:
             summary["errors"].append(
                 {
@@ -961,7 +1321,9 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
         "error_count": 0,
         "total_extracted_frames": 0,
         "total_detected_frames": 0,
+        "total_no_detection_frames": 0,
         "total_frame_errors": 0,
+        "total_warning_frames": 0,
         "videos": [],
         "errors": [],
     }
@@ -984,7 +1346,9 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
                 "frame_interval_seconds": frame_interval_seconds,
                 "extracted_frame_count": len(extracted_frames),
                 "success_count": 0,
+                "no_detection_count": 0,
                 "error_count": 0,
+                "no_detections": [],
                 "results": [],
                 "errors": [],
             }
@@ -1004,6 +1368,25 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
                     result["timestamp_seconds"] = frame_info["timestamp_seconds"]
                     video_summary["results"].append(result)
                     video_summary["success_count"] += 1
+                except NoAdsDetectedError as exc:
+                    no_ad_path = no_ad_output_path(frame_path, detections_dir)
+                    cleanup_output_variants(
+                        image_path=frame_path,
+                        output_dir=detections_dir,
+                        keep_path=no_ad_path,
+                    )
+                    save_no_ad_image(image_path=frame_path, output_path=no_ad_path)
+                    video_summary["no_detections"].append(
+                        {
+                            "frame_path": str(frame_path),
+                            "frame_index": frame_info["frame_index"],
+                            "timestamp_seconds": frame_info["timestamp_seconds"],
+                            "report": "No ads dection",
+                            "reason": exc.reason,
+                            "output_image_path": str(no_ad_path),
+                        }
+                    )
+                    video_summary["no_detection_count"] += 1
                 except Exception as exc:
                     video_summary["errors"].append(
                         {
@@ -1015,10 +1398,13 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
                     )
                     video_summary["error_count"] += 1
 
+            video_summary = apply_video_frame_warnings(video_summary)
             summary["videos"].append(video_summary)
             summary["total_extracted_frames"] += video_summary["extracted_frame_count"]
             summary["total_detected_frames"] += video_summary["success_count"]
+            summary["total_no_detection_frames"] += video_summary["no_detection_count"]
             summary["total_frame_errors"] += video_summary["error_count"]
+            summary["total_warning_frames"] += video_summary["warning_count"]
             if video_summary["error_count"] == 0:
                 summary["success_count"] += 1
             else:
@@ -1043,10 +1429,11 @@ def print_image_batch_human_readable(summary):
         "Processed: "
         f"{summary['processed_count']} | "
         f"Success: {summary['success_count']} | "
+        f"No ads: {summary['no_detection_count']} | "
         f"Errors: {summary['error_count']}"
     )
 
-    if not summary["results"] and not summary["errors"]:
+    if not summary["results"] and not summary["errors"] and not summary["no_detections"]:
         print("No supported image files found.")
         return
 
@@ -1054,6 +1441,14 @@ def print_image_batch_human_readable(summary):
         print()
         print(f"--- Result {index} ---")
         print_human_readable(result)
+
+    for index, item in enumerate(summary["no_detections"], start=1):
+        print()
+        print(f"--- No Detection {index} ---")
+        print(f"Image: {item['image_path']}")
+        print(f"Report: {item['report']}")
+        print(f"Reason: {item['reason']}")
+        print(f"Output image: {item['output_image_path']}")
 
     for index, error_info in enumerate(summary["errors"], start=1):
         print()
@@ -1077,6 +1472,8 @@ def print_video_batch_human_readable(summary):
         "Frames: "
         f"Extracted {summary['total_extracted_frames']} | "
         f"Detected {summary['total_detected_frames']} | "
+        f"No ads {summary['total_no_detection_frames']} | "
+        f"Warnings {summary['total_warning_frames']} | "
         f"Frame errors {summary['total_frame_errors']}"
     )
 
@@ -1094,15 +1491,23 @@ def print_video_batch_human_readable(summary):
             "Extracted frames: "
             f"{video_summary['extracted_frame_count']} | "
             f"Success: {video_summary['success_count']} | "
+            f"No ads: {video_summary['no_detection_count']} | "
+            f"Warnings: {video_summary['warning_count']} | "
             f"Errors: {video_summary['error_count']}"
         )
 
         for frame_index, result in enumerate(video_summary["results"], start=1):
             print()
-            print(
-                f"--- Frame {frame_index} "
-                f"(t={result['timestamp_seconds']:.3f}s, idx={result['frame_index']}) ---"
-            )
+            if result.get("is_warning"):
+                print(
+                    f"!!! WARNING FRAME {frame_index} "
+                    f"(t={result['timestamp_seconds']:.3f}s, idx={result['frame_index']}) !!!"
+                )
+            else:
+                print(
+                    f"--- Frame {frame_index} "
+                    f"(t={result['timestamp_seconds']:.3f}s, idx={result['frame_index']}) ---"
+                )
             print_human_readable(result)
 
         for frame_index, error_info in enumerate(video_summary["errors"], start=1):
@@ -1113,6 +1518,17 @@ def print_video_batch_human_readable(summary):
             )
             print(f"Frame: {error_info['frame_path']}")
             print(f"Error: {error_info['error']}")
+
+        for frame_index, item in enumerate(video_summary["no_detections"], start=1):
+            print()
+            print(
+                f"--- No Detection Frame {frame_index} "
+                f"(t={item['timestamp_seconds']:.3f}s, idx={item['frame_index']}) ---"
+            )
+            print(f"Frame: {item['frame_path']}")
+            print(f"Report: {item['report']}")
+            print(f"Reason: {item['reason']}")
+            print(f"Output image: {item['output_image_path']}")
 
     for index, error_info in enumerate(summary["errors"], start=1):
         print()
