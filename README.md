@@ -47,6 +47,12 @@ python detect_ad.py --source images --json
 python detect_ad.py --source videos --json
 ```
 
+Trong lúc script đang chạy, console sẽ hiển thị progress bar cho:
+
+- batch ảnh
+- quá trình extract frame từ video
+- quá trình detect frame trong video
+
 ## Tham số
 
 - `--source`: bắt buộc, chọn `images` hoặc `videos`

@@ -15,6 +15,7 @@ MIN_EDGE_RATIO = 0.01
 DEFAULT_INPUT_DIR = "input"
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_FRAME_INTERVAL_SECONDS = 2.0
+PROGRESS_BAR_WIDTH = 28
 WARNING_MIN_FRAMES = 3
 WARNING_STABLE_GROUP_MIN_FRAMES = 5
 WARNING_AREA_RELATIVE_TOLERANCE = 0.03
@@ -477,6 +478,30 @@ def format_timestamp_tag(seconds):
     return f"{seconds:08.2f}".replace(".", "_")
 
 
+def print_progress(label, current, total):
+    total = max(0, int(total))
+    current = max(0, min(int(current), total if total > 0 else int(current)))
+
+    if total <= 0:
+        print(f"\r{label}: {current}", end="", flush=True)
+        return
+
+    ratio = current / float(total)
+    filled = int(round(PROGRESS_BAR_WIDTH * ratio))
+    bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+    percent = int(round(ratio * 100))
+    print(
+        f"\r{label}: [{bar}] {current}/{total} ({percent}%)",
+        end="",
+        flush=True,
+    )
+
+
+def finish_progress(total):
+    if total > 0:
+        print()
+
+
 def extract_frames_from_video(video_path, frames_dir, frame_interval_seconds):
     if frame_interval_seconds <= 0:
         raise ValueError("--frame-interval must be greater than 0.")
@@ -489,6 +514,7 @@ def extract_frames_from_video(video_path, frames_dir, frame_interval_seconds):
     fps = capture.get(cv2.CAP_PROP_FPS)
     if fps is None or fps <= 0:
         fps = 1.0
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
 
     frame_step = max(1, int(round(fps * frame_interval_seconds)))
     extracted_frames = []
@@ -519,8 +545,14 @@ def extract_frames_from_video(video_path, frames_dir, frame_interval_seconds):
             next_capture_index += frame_step
 
         capture_index += 1
+        print_progress(
+            label=f"Extracting {video_path.stem}",
+            current=capture_index,
+            total=total_frames,
+        )
 
     capture.release()
+    finish_progress(total_frames)
 
     if not extracted_frames:
         raise RuntimeError(f"No frames extracted from video: {video_path}")
@@ -1300,6 +1332,15 @@ def process_image_directory(source_dir, output_dir, color_hint, shape_hint, tole
                 }
             )
             summary["error_count"] += 1
+        finally:
+            progress_current = (
+                summary["success_count"]
+                + summary["no_detection_count"]
+                + summary["error_count"]
+            )
+            print_progress("Processing images", progress_current, len(image_paths))
+
+    finish_progress(len(image_paths))
 
     return summary
 
@@ -1397,7 +1438,19 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
                         }
                     )
                     video_summary["error_count"] += 1
+                finally:
+                    processed_frames = (
+                        video_summary["success_count"]
+                        + video_summary["no_detection_count"]
+                        + video_summary["error_count"]
+                    )
+                    print_progress(
+                        label=f"Detecting {video_path.stem}",
+                        current=processed_frames,
+                        total=len(extracted_frames),
+                    )
 
+            finish_progress(len(extracted_frames))
             video_summary = apply_video_frame_warnings(video_summary)
             summary["videos"].append(video_summary)
             summary["total_extracted_frames"] += video_summary["extracted_frame_count"]
@@ -1417,6 +1470,11 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
                 }
             )
             summary["error_count"] += 1
+        finally:
+            processed_videos = summary["success_count"] + summary["error_count"]
+            print_progress("Processing videos", processed_videos, len(video_paths))
+
+    finish_progress(len(video_paths))
 
     return summary
 
