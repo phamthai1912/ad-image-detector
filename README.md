@@ -56,6 +56,9 @@ Trong lúc script đang chạy, console sẽ hiển thị progress bar cho:
 ## Tham số
 
 - `--source`: bắt buộc, chọn `images` hoặc `videos`
+- `--ad-mode`: chọn mode detect ad
+  - `monochrome`: mặc định, dành cho ad đơn sắc
+  - `multicolor`: dành cho ad đa sắc, detect theo boundary dọc/ngang
 - `--color`: màu ad ở dạng hex, ví dụ `#FFA223` hoặc `FFA223`
 - `--shape`: gợi ý shape cho ad: `auto`, `l`, `rectangle`, `square`
 - `--tolerance`: độ lệch màu tối đa khi tạo mask, mặc định `20`
@@ -75,6 +78,21 @@ Một ảnh hoặc frame sẽ bị report `No ads dection` nếu rơi vào một
 - vùng detect không phải `L`, `square`, hoặc `rectangle`
 - tỷ lệ diện tích ad nhỏ hơn `5%`
 - vùng detect phủ gần như toàn bộ frame (`>= 99.5%`)
+
+## Multicolor Mode
+
+Khi chạy với `--ad-mode multicolor`, script sẽ:
+
+1. tìm các điểm đổi màu mạnh giữa `ad` và `content`
+2. gom các điểm đó thành boundary thẳng theo trục dọc/ngang
+3. sinh ra các object hình học từ boundary đó
+4. chỉ mask object được chọn là ad
+
+Rule chọn ad trong `multicolor` mode:
+
+- nếu có object hình `L` thì ưu tiên object đó
+- nếu không có `L`, object nhỏ hơn trong các shape hợp lệ `rectangle/square` sẽ được xem là ad
+- nếu không tìm được boundary đủ thẳng hoặc boundary không tạo được shape hợp lệ thì trả `No ads dection`
 
 ## Output
 

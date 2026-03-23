@@ -17,7 +17,7 @@ DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_FRAME_INTERVAL_SECONDS = 2.0
 PROGRESS_BAR_WIDTH = 28
 WARNING_MIN_FRAMES = 3
-WARNING_STABLE_GROUP_MIN_FRAMES = 5
+WARNING_STABLE_GROUP_MIN_FRAMES = 3
 WARNING_AREA_RELATIVE_TOLERANCE = 0.03
 WARNING_AREA_ABSOLUTE_TOLERANCE_PIXELS = 500
 WARNING_DIMENSION_RELATIVE_TOLERANCE = 0.03
@@ -26,6 +26,8 @@ MIN_L_PAIR_SCORE = 0.35
 MIN_RECTANGULARITY_FOR_RECT = 0.9
 FULL_FRAME_AD_THRESHOLD_PERCENT = 99.5
 MIN_AD_AREA_PERCENT = 5.0
+MULTICOLOR_BOUNDARY_MARGIN_RATIO = 0.05
+MULTICOLOR_BOUNDARY_MERGE_RATIO = 0.02
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
@@ -45,6 +47,12 @@ def parse_args():
         required=True,
         choices=["images", "videos"],
         help="Choose the batch input source under input/: images or videos.",
+    )
+    parser.add_argument(
+        "--ad-mode",
+        choices=["monochrome", "multicolor"],
+        default="monochrome",
+        help="Ad detection mode. monochrome is default; multicolor uses straight boundaries.",
     )
     parser.add_argument(
         "--color",
@@ -168,6 +176,490 @@ def build_color_mask(image_rgb, color_rgb, tolerance):
 
     kernel = np.ones((3, 3), np.uint8)
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+
+def smooth_profile(values, kernel_size=9):
+    if len(values) == 0:
+        return values
+    kernel_size = max(3, int(kernel_size) | 1)
+    kernel = np.ones(kernel_size, dtype=np.float32) / float(kernel_size)
+    return np.convolve(values, kernel, mode="same")
+
+
+def boundary_diff_maps(image_rgb):
+    image_int = image_rgb.astype(np.int16)
+    column_diff = np.mean(
+        np.abs(image_int[:, 1:, :] - image_int[:, :-1, :]),
+        axis=2,
+    )
+    row_diff = np.mean(
+        np.abs(image_int[1:, :, :] - image_int[:-1, :, :]),
+        axis=2,
+    )
+    return column_diff, row_diff
+
+
+def boundary_strength_profiles(image_rgb):
+    column_diff, row_diff = boundary_diff_maps(image_rgb)
+    column_profile = np.percentile(column_diff, 85, axis=0)
+    row_profile = np.percentile(row_diff, 85, axis=1)
+    return smooth_profile(column_profile), smooth_profile(row_profile)
+
+
+def boundary_extent_ratio(diff_values, tolerance):
+    extent_threshold = max(7.0, float(tolerance) * 0.35)
+    return float(np.mean(diff_values >= extent_threshold))
+
+
+def merge_boundary_positions(candidates, merge_distance):
+    if not candidates:
+        return []
+
+    groups = []
+    current_group = [candidates[0]]
+    for candidate in candidates[1:]:
+        if candidate[0] - current_group[-1][0] <= merge_distance:
+            current_group.append(candidate)
+            continue
+        groups.append(current_group)
+        current_group = [candidate]
+    groups.append(current_group)
+
+    merged_positions = []
+    for group in groups:
+        positions = np.array([item[0] for item in group], dtype=np.float64)
+        strengths = np.array([item[1] for item in group], dtype=np.float64)
+        merged_positions.append(int(round(np.average(positions, weights=strengths))))
+    return merged_positions
+
+
+def detect_boundary_positions(profile, frame_size, tolerance):
+    if len(profile) == 0:
+        return []
+
+    margin = max(12, int(round(frame_size * MULTICOLOR_BOUNDARY_MARGIN_RATIO)))
+    merge_distance = max(8, int(round(frame_size * MULTICOLOR_BOUNDARY_MERGE_RATIO)))
+    threshold = float(np.mean(profile) + np.std(profile) * 0.8 + max(3.0, tolerance * 0.15))
+
+    candidates = [
+        (index + 1, float(value))
+        for index, value in enumerate(profile)
+        if margin < index + 1 < frame_size - margin and value >= threshold
+    ]
+    if not candidates:
+        return []
+
+    return merge_boundary_positions(candidates, merge_distance)
+
+
+def mask_bbox(component_mask):
+    ys, xs = np.where(component_mask)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+
+    x_min = int(xs.min())
+    x_max = int(xs.max())
+    y_min = int(ys.min())
+    y_max = int(ys.max())
+    return {
+        "x": x_min,
+        "y": y_min,
+        "width": x_max - x_min + 1,
+        "height": y_max - y_min + 1,
+    }
+
+
+def average_color_hex(image_rgb, component_mask):
+    pixels = image_rgb[component_mask.astype(bool)]
+    if len(pixels) == 0:
+        return "#00FFFF"
+    mean_color = tuple(int(round(value)) for value in np.mean(pixels, axis=0).tolist())
+    return rgb_to_hex(mean_color)
+
+
+def make_candidate_from_mask(image_rgb, component_mask, shape_hint, boundary_score=0.0):
+    bbox = mask_bbox(component_mask)
+    if bbox is None:
+        return None
+
+    area_pixels = int(component_mask.sum())
+    component_crop = component_mask[
+        bbox["y"] : bbox["y"] + bbox["height"],
+        bbox["x"] : bbox["x"] + bbox["width"],
+    ]
+    inferred_shape, edges, edge_pair, rectangularity, best_pair_score = infer_shape_from_component(
+        component_crop=component_crop,
+        bbox_width=bbox["width"],
+        bbox_height=bbox["height"],
+        area_pixels=area_pixels,
+    )
+    if inferred_shape == "unknown":
+        return None
+
+    l_balance_score = 0.0
+    if inferred_shape == "l" and edge_pair is not None:
+        edge_a, edge_b = normalize_l_pair(edge_pair)
+        vertical_thickness = edges[edge_a] if edge_a in ("left", "right") else edges[edge_b]
+        horizontal_thickness = edges[edge_a] if edge_a in ("top", "bottom") else edges[edge_b]
+        if max(vertical_thickness, horizontal_thickness) > 0:
+            l_balance_score = min(vertical_thickness, horizontal_thickness) / float(
+                max(vertical_thickness, horizontal_thickness)
+            )
+
+    return {
+        "component_mask": component_mask,
+        "bbox": bbox,
+        "area_pixels": area_pixels,
+        "inferred_shape": inferred_shape,
+        "edges": edges,
+        "edge_pair": edge_pair,
+        "rectangularity": rectangularity,
+        "best_pair_score": best_pair_score,
+        "selection_score": compute_component_score(
+            area_pixels=area_pixels,
+            inferred_shape=inferred_shape,
+            rectangularity=rectangularity,
+            best_pair_score=best_pair_score,
+            bbox_width=bbox["width"],
+            bbox_height=bbox["height"],
+            shape_hint=shape_hint,
+        ),
+        "detected_color_hex": average_color_hex(image_rgb, component_mask),
+        "boundary_score": float(boundary_score),
+        "l_balance_score": float(l_balance_score),
+    }
+
+
+def rectangle_mask(image_shape, x0, y0, x1, y1):
+    component_mask = np.zeros(image_shape[:2], dtype=bool)
+    component_mask[y0:y1, x0:x1] = True
+    return component_mask
+
+
+def l_shape_mask(image_shape, boundary_x, boundary_y, content_corner):
+    image_height, image_width = image_shape[:2]
+    component_mask = np.ones((image_height, image_width), dtype=bool)
+    content_boxes = {
+        "top-left": (0, 0, boundary_x, boundary_y),
+        "top-right": (boundary_x, 0, image_width, boundary_y),
+        "bottom-left": (0, boundary_y, boundary_x, image_height),
+        "bottom-right": (boundary_x, boundary_y, image_width, image_height),
+    }
+    x0, y0, x1, y1 = content_boxes[content_corner]
+    component_mask[y0:y1, x0:x1] = False
+    return component_mask
+
+
+def generate_multicolor_candidates(
+    image_rgb,
+    vertical_boundaries,
+    horizontal_boundaries,
+    vertical_strengths,
+    horizontal_strengths,
+    shape_hint,
+):
+    image_height, image_width = image_rgb.shape[:2]
+    candidates = []
+
+    for boundary_x in vertical_boundaries:
+        for component_mask in (
+            rectangle_mask(image_rgb.shape, 0, 0, boundary_x, image_height),
+            rectangle_mask(image_rgb.shape, boundary_x, 0, image_width, image_height),
+        ):
+            candidate = make_candidate_from_mask(
+                image_rgb,
+                component_mask,
+                shape_hint,
+                boundary_score=vertical_strengths.get(boundary_x, 0.0),
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+
+    for boundary_y in horizontal_boundaries:
+        for component_mask in (
+            rectangle_mask(image_rgb.shape, 0, 0, image_width, boundary_y),
+            rectangle_mask(image_rgb.shape, 0, boundary_y, image_width, image_height),
+        ):
+            candidate = make_candidate_from_mask(
+                image_rgb,
+                component_mask,
+                shape_hint,
+                boundary_score=horizontal_strengths.get(boundary_y, 0.0),
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+
+    for boundary_x in vertical_boundaries:
+        for boundary_y in horizontal_boundaries:
+            for content_corner in ("top-left", "top-right", "bottom-left", "bottom-right"):
+                component_mask = l_shape_mask(
+                    image_shape=image_rgb.shape,
+                    boundary_x=boundary_x,
+                    boundary_y=boundary_y,
+                    content_corner=content_corner,
+                )
+                candidate = make_candidate_from_mask(
+                    image_rgb,
+                    component_mask,
+                    shape_hint,
+                    boundary_score=(
+                        vertical_strengths.get(boundary_x, 0.0)
+                        + horizontal_strengths.get(boundary_y, 0.0)
+                    ),
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+
+    return candidates
+
+
+def build_multicolor_candidates(image_rgb, shape_hint, tolerance):
+    image_width = image_rgb.shape[1]
+    image_height = image_rgb.shape[0]
+    column_diff, row_diff = boundary_diff_maps(image_rgb)
+    vertical_profile = smooth_profile(np.percentile(column_diff, 85, axis=0))
+    horizontal_profile = smooth_profile(np.percentile(row_diff, 85, axis=1))
+    vertical_boundaries = detect_boundary_positions(vertical_profile, image_width, tolerance)
+    horizontal_boundaries = detect_boundary_positions(horizontal_profile, image_height, tolerance)
+    vertical_strengths = {
+        position: float(vertical_profile[position - 1])
+        * boundary_extent_ratio(column_diff[:, position - 1], tolerance)
+        for position in vertical_boundaries
+    }
+    horizontal_strengths = {
+        position: float(horizontal_profile[position - 1])
+        * boundary_extent_ratio(row_diff[position - 1, :], tolerance)
+        for position in horizontal_boundaries
+    }
+    candidates = generate_multicolor_candidates(
+        image_rgb=image_rgb,
+        vertical_boundaries=vertical_boundaries,
+        horizontal_boundaries=horizontal_boundaries,
+        vertical_strengths=vertical_strengths,
+        horizontal_strengths=horizontal_strengths,
+        shape_hint=shape_hint,
+    )
+    return {
+        "candidates": candidates,
+        "vertical_boundaries": vertical_boundaries,
+        "horizontal_boundaries": horizontal_boundaries,
+        "boundary_count": len(vertical_boundaries) + len(horizontal_boundaries),
+    }
+
+
+def choose_multicolor_candidate(candidates, shape_hint):
+    if not candidates:
+        return None
+
+    l_candidates = [candidate for candidate in candidates if candidate["inferred_shape"] == "l"]
+    rect_candidates = [candidate for candidate in candidates if candidate["inferred_shape"] in {"rectangle", "square"}]
+
+    if shape_hint in {"auto", "l"} and l_candidates:
+        def l_horizontal_arm_penalty(candidate):
+            edge_a, edge_b = normalize_l_pair(candidate["edge_pair"])
+            horizontal_edge = edge_a if edge_a in ("top", "bottom") else edge_b
+            horizontal_ratio = candidate["edges"][horizontal_edge] / float(candidate["bbox"]["height"])
+            if 0.18 <= horizontal_ratio <= 0.38:
+                return 0.0
+            if horizontal_ratio < 0.18:
+                return 0.18 - horizontal_ratio
+            return horizontal_ratio - 0.38
+
+        best_l = min(
+            l_candidates,
+            key=lambda candidate: (
+                l_horizontal_arm_penalty(candidate),
+                -candidate["boundary_score"],
+                candidate["area_pixels"],
+            ),
+        )
+        
+        # For auto mode, compare best L-shape with rectangles
+        # Prefer rectangles if they have significantly better boundary scores
+        # or if they are thin (aspect ratio > 3:1), which is typical for banner ads
+        if shape_hint == "auto" and rect_candidates:
+            best_rect = max(
+                rect_candidates,
+                key=lambda candidate: candidate["boundary_score"]
+            )
+            bbox_width = best_rect["bbox"]["width"]
+            bbox_height = best_rect["bbox"]["height"]
+            aspect_ratio = max(bbox_width, bbox_height) / float(min(bbox_width, bbox_height))
+            
+            # Prefer rectangle if it has comparable or better boundary score
+            # and has extreme aspect ratio (thin rectangle/banner)
+            if aspect_ratio > 3.0 and best_rect["boundary_score"] >= best_l["boundary_score"] * 0.8:
+                return best_rect
+        
+        return best_l
+
+    def priority(candidate):
+        inferred_shape = candidate["inferred_shape"]
+        area_pixels = candidate["area_pixels"]
+        boundary_score = candidate["boundary_score"]
+        l_balance_score = candidate.get("l_balance_score", 0.0)
+
+        if shape_hint == "l":
+            return (
+                0 if inferred_shape == "l" else 1,
+                -(boundary_score * (0.5 + l_balance_score)),
+                area_pixels,
+            )
+        if shape_hint == "square":
+            return (0 if inferred_shape == "square" else 1, -boundary_score, area_pixels)
+        if shape_hint == "rectangle":
+            is_match = inferred_shape in {"rectangle", "square"}
+            return (0 if is_match else 1, -boundary_score, area_pixels)
+
+        return (1, area_pixels, -boundary_score)
+
+    return min(candidates, key=priority)
+
+
+def build_l_dimensions_from_candidate(candidate):
+    return build_dimensions("l", candidate["bbox"], candidate["edges"], candidate["edge_pair"])
+
+
+def build_multicolor_l_reference(results):
+    l_results = [result for result in results if result["shape"] == "l"]
+    if len(l_results) < 2:
+        return None
+
+    corners = [result["dimensions"]["corner"] for result in l_results]
+    dominant_corner = dominant_value(corners)
+    dominant_results = [
+        result
+        for result in l_results
+        if result["dimensions"]["corner"] == dominant_corner
+    ]
+    if len(dominant_results) < 2:
+        return None
+
+    reference = {
+        "corner": dominant_corner,
+        "area_pixels": numeric_median([result["area_pixels"] for result in dominant_results]),
+    }
+    metric_values = []
+    for result in dominant_results:
+        dims = result["dimensions"]
+        values = {
+            "bottom_arm_height_px": dims["bottom_arm"]["height_px"] if "bottom_arm" in dims else None,
+            "top_arm_height_px": dims["top_arm"]["height_px"] if "top_arm" in dims else None,
+            "left_arm_width_px": dims["left_arm"]["width_px"] if "left_arm" in dims else None,
+            "right_arm_width_px": dims["right_arm"]["width_px"] if "right_arm" in dims else None,
+        }
+        metric_values.append(values)
+
+    for metric_name in list(metric_values[0].keys()):
+        present_values = [item[metric_name] for item in metric_values if item[metric_name] is not None]
+        if present_values:
+            reference[metric_name] = numeric_median(present_values)
+
+    return reference
+
+
+def build_stable_multicolor_l_reference(results):
+    stable_references = build_stable_warning_references(results)
+    l_references = []
+    for reference in stable_references:
+        metrics = reference.get("metrics", {})
+        if reference["shape"] != "l" or "corner" not in metrics:
+            continue
+        l_references.append(
+            {
+                "shape": reference["shape"],
+                "corner": metrics["corner"],
+                "area_pixels": reference["area_pixels"],
+                "frame_count": reference.get("frame_count", 0),
+                "bottom_arm_height_px": metrics.get("bottom_arm_height_px"),
+                "top_arm_height_px": metrics.get("top_arm_height_px"),
+                "left_arm_width_px": metrics.get("left_arm_width_px"),
+                "right_arm_width_px": metrics.get("right_arm_width_px"),
+            }
+        )
+
+    if not l_references:
+        return None
+
+    return max(
+        l_references,
+        key=lambda reference: (
+            reference["frame_count"],
+            -reference["area_pixels"],
+        ),
+    )
+
+
+def choose_multicolor_candidate_with_reference(candidates, shape_hint, reference):
+    if reference is None:
+        return choose_multicolor_candidate(candidates, shape_hint)
+
+    l_candidates = [candidate for candidate in candidates if candidate["inferred_shape"] == "l"]
+    if shape_hint not in {"auto", "l"} or not l_candidates:
+        return choose_multicolor_candidate(candidates, shape_hint)
+
+    def reference_distance(candidate):
+        dims = build_l_dimensions_from_candidate(candidate)
+        corner = dims["corner"]
+        corner_penalty = 0 if corner == reference["corner"] else 1
+
+        horizontal_penalty = 0.0
+        if "bottom_arm" in dims and "bottom_arm_height_px" in reference:
+            horizontal_penalty = abs(
+                dims["bottom_arm"]["height_px"] - reference["bottom_arm_height_px"]
+            )
+        elif "top_arm" in dims and "top_arm_height_px" in reference:
+            horizontal_penalty = abs(
+                dims["top_arm"]["height_px"] - reference["top_arm_height_px"]
+            )
+        else:
+            horizontal_penalty = candidate["bbox"]["height"]
+
+        vertical_penalty = 0.0
+        if "left_arm" in dims and "left_arm_width_px" in reference:
+            vertical_penalty = abs(
+                dims["left_arm"]["width_px"] - reference["left_arm_width_px"]
+            )
+        elif "right_arm" in dims and "right_arm_width_px" in reference:
+            vertical_penalty = abs(
+                dims["right_arm"]["width_px"] - reference["right_arm_width_px"]
+            )
+        else:
+            vertical_penalty = candidate["bbox"]["width"]
+
+        area_penalty = abs(candidate["area_pixels"] - reference["area_pixels"])
+        return (
+            corner_penalty,
+            horizontal_penalty,
+            vertical_penalty,
+            area_penalty,
+            -candidate["boundary_score"],
+            candidate["area_pixels"],
+        )
+
+    return min(l_candidates, key=reference_distance)
+
+
+def l_mask_from_reference(image_shape, corner, vertical_width, horizontal_height):
+    image_height, image_width = image_shape[:2]
+    mask = np.zeros((image_height, image_width), dtype=bool)
+
+    if corner == "bottom-left":
+        mask[:, :vertical_width] = True
+        mask[image_height - horizontal_height :, :] = True
+        return mask
+    if corner == "bottom-right":
+        mask[:, image_width - vertical_width :] = True
+        mask[image_height - horizontal_height :, :] = True
+        return mask
+    if corner == "top-left":
+        mask[:, :vertical_width] = True
+        mask[:horizontal_height, :] = True
+        return mask
+
+    mask[:, image_width - vertical_width :] = True
+    mask[:horizontal_height, :] = True
+    return mask
 
 
 def is_border_component(component_mask):
@@ -815,6 +1307,208 @@ def apply_video_frame_warnings(video_summary):
     return video_summary
 
 
+def rebuild_multicolor_result(image_path, shape_hint, tolerance, reference):
+    image_rgb = load_image_rgb(image_path)
+    multicolor_data = build_multicolor_candidates(
+        image_rgb=image_rgb,
+        shape_hint=shape_hint,
+        tolerance=tolerance,
+    )
+    candidates = multicolor_data["candidates"]
+    best_component = choose_multicolor_candidate_with_reference(
+        candidates=candidates,
+        shape_hint=shape_hint,
+        reference=reference,
+    )
+    if best_component is None:
+        return None
+
+    image_width = image_rgb.shape[1]
+    image_height = image_rgb.shape[0]
+    component_mask = best_component["component_mask"]
+    inferred_shape = best_component["inferred_shape"]
+    edge_pair = best_component["edge_pair"]
+    bbox = best_component["bbox"]
+    area_pixels = best_component["area_pixels"]
+    area_percent = float(area_pixels) / float(image_width * image_height) * 100.0
+    if area_percent < MIN_AD_AREA_PERCENT or area_percent >= FULL_FRAME_AD_THRESHOLD_PERCENT:
+        return None
+
+    result = {
+        "image_path": str(image_path),
+        "detected_color_hex": best_component["detected_color_hex"],
+        "shape": resolve_shape(shape_hint, inferred_shape),
+        "inferred_shape": inferred_shape,
+        "bbox": bbox,
+        "area_pixels": int(area_pixels),
+        "area_percent": round(area_percent, 3),
+        "dimensions": build_dimensions(resolve_shape(shape_hint, inferred_shape), bbox, best_component["edges"], edge_pair),
+        "tolerance": tolerance,
+        "rectangularity": round(best_component["rectangularity"], 4),
+        "selection_score": round(best_component["selection_score"], 3),
+        "ad_mode": "multicolor",
+        "boundary_count": multicolor_data["boundary_count"],
+    }
+    render_data = {
+        "image_rgb": image_rgb,
+        "component_mask": component_mask,
+        "edge_pair": edge_pair,
+    }
+    return result, render_data
+
+
+def snap_multicolor_result_to_l_reference(result, reference):
+    if result["shape"] != "l":
+        return None
+
+    dimensions = result["dimensions"]
+    corner = reference["corner"]
+    current_horizontal_height = (
+        dimensions["bottom_arm"]["height_px"]
+        if "bottom_arm" in dimensions
+        else dimensions["top_arm"]["height_px"]
+    )
+    current_vertical_width = (
+        dimensions["left_arm"]["width_px"]
+        if "left_arm" in dimensions
+        else dimensions["right_arm"]["width_px"]
+    )
+    target_horizontal_height = reference.get("bottom_arm_height_px")
+    if corner.startswith("top"):
+        target_horizontal_height = reference.get("top_arm_height_px")
+    target_vertical_width = reference.get("left_arm_width_px")
+    if corner.endswith("right"):
+        target_vertical_width = reference.get("right_arm_width_px")
+
+    if target_horizontal_height is None or target_vertical_width is None:
+        return None
+
+    horizontal_delta = abs(current_horizontal_height - target_horizontal_height)
+    vertical_delta = abs(current_vertical_width - target_vertical_width)
+    if horizontal_delta > 60 or vertical_delta > 40:
+        return None
+
+    image_rgb = load_image_rgb(result["image_path"])
+    component_mask = l_mask_from_reference(
+        image_shape=image_rgb.shape,
+        corner=corner,
+        vertical_width=int(round(target_vertical_width)),
+        horizontal_height=int(round(target_horizontal_height)),
+    )
+    bbox = mask_bbox(component_mask)
+    if bbox is None:
+        return None
+
+    area_pixels = int(component_mask.sum())
+    image_height, image_width = image_rgb.shape[:2]
+    area_percent = float(area_pixels) / float(image_width * image_height) * 100.0
+    snapped_result = dict(result)
+    snapped_result["detected_color_hex"] = average_color_hex(image_rgb, component_mask)
+    snapped_result["bbox"] = bbox
+    snapped_result["area_pixels"] = area_pixels
+    snapped_result["area_percent"] = round(area_percent, 3)
+    snapped_result["dimensions"] = {
+        "corner": corner,
+    }
+    if corner.endswith("left"):
+        snapped_result["dimensions"]["left_arm"] = {
+            "width_px": int(round(target_vertical_width)),
+            "height_px": image_height,
+        }
+    else:
+        snapped_result["dimensions"]["right_arm"] = {
+            "width_px": int(round(target_vertical_width)),
+            "height_px": image_height,
+        }
+
+    if corner.startswith("bottom"):
+        snapped_result["dimensions"]["bottom_arm"] = {
+            "width_px": image_width,
+            "height_px": int(round(target_horizontal_height)),
+        }
+        edge_pair = ("left", "bottom") if corner == "bottom-left" else ("right", "bottom")
+    else:
+        snapped_result["dimensions"]["top_arm"] = {
+            "width_px": image_width,
+            "height_px": int(round(target_horizontal_height)),
+        }
+        edge_pair = ("left", "top") if corner == "top-left" else ("right", "top")
+
+    render_data = {
+        "image_rgb": image_rgb,
+        "component_mask": component_mask,
+        "edge_pair": edge_pair,
+    }
+    return snapped_result, render_data
+
+
+def refine_multicolor_video_results(video_summary, shape_hint, tolerance):
+    if video_summary.get("ad_mode") != "multicolor":
+        return video_summary
+
+    corner_reference = build_multicolor_l_reference(video_summary["results"])
+    if corner_reference is None:
+        return video_summary
+
+    for result in video_summary["results"]:
+        if result["shape"] != "l":
+            continue
+        if result["dimensions"]["corner"] == corner_reference["corner"]:
+            continue
+
+        rebuilt = rebuild_multicolor_result(
+            image_path=Path(result["image_path"]),
+            shape_hint=shape_hint,
+            tolerance=tolerance,
+            reference=corner_reference,
+        )
+        if rebuilt is None:
+            continue
+
+        rebuilt_result, render_data = rebuilt
+        output_path = Path(result["output_image_path"])
+        rebuilt_result["frame_index"] = result["frame_index"]
+        rebuilt_result["timestamp_seconds"] = result["timestamp_seconds"]
+        rebuilt_result["output_image_path"] = str(output_path)
+        save_annotated_image(
+            image_rgb=render_data["image_rgb"],
+            component_mask=render_data["component_mask"],
+            result=rebuilt_result,
+            edge_pair=render_data["edge_pair"],
+            output_path=output_path,
+        )
+        result.clear()
+        result.update(rebuilt_result)
+
+    stable_reference = build_stable_multicolor_l_reference(video_summary["results"])
+    if stable_reference is None:
+        return video_summary
+
+    for result in video_summary["results"]:
+        if result["shape"] != "l":
+            continue
+        rebuilt = snap_multicolor_result_to_l_reference(result, stable_reference)
+        if rebuilt is None:
+            continue
+
+        rebuilt_result, render_data = rebuilt
+        output_path = Path(result["output_image_path"])
+        rebuilt_result["frame_index"] = result["frame_index"]
+        rebuilt_result["timestamp_seconds"] = result["timestamp_seconds"]
+        rebuilt_result["output_image_path"] = str(output_path)
+        save_annotated_image(
+            image_rgb=render_data["image_rgb"],
+            component_mask=render_data["component_mask"],
+            result=rebuilt_result,
+            edge_pair=render_data["edge_pair"],
+            output_path=output_path,
+        )
+        result.clear()
+        result.update(rebuilt_result)
+
+    return video_summary
+
+
 def choose_annotation_color(ad_color_rgb):
     candidate_colors_rgb = [
         (0, 255, 255),
@@ -1140,7 +1834,7 @@ def save_annotated_image(image_rgb, component_mask, result, edge_pair, output_pa
     cv2.imwrite(str(output_path), image_bgr)
 
 
-def detect_ad(image_path, color_hint, shape_hint, tolerance):
+def detect_ad_monochrome(image_path, color_hint, shape_hint, tolerance):
     image_rgb = load_image_rgb(image_path)
     image_width = image_rgb.shape[1]
     image_height = image_rgb.shape[0]
@@ -1213,6 +1907,93 @@ def detect_ad(image_path, color_hint, shape_hint, tolerance):
     return result, render_data
 
 
+def detect_ad_multicolor(image_path, shape_hint, tolerance):
+    image_rgb = load_image_rgb(image_path)
+    image_width = image_rgb.shape[1]
+    image_height = image_rgb.shape[0]
+
+    multicolor_data = build_multicolor_candidates(
+        image_rgb=image_rgb,
+        shape_hint=shape_hint,
+        tolerance=tolerance,
+    )
+    vertical_boundaries = multicolor_data["vertical_boundaries"]
+    horizontal_boundaries = multicolor_data["horizontal_boundaries"]
+    if not vertical_boundaries and not horizontal_boundaries:
+        raise NoAdsDetectedError(
+            "No ads dection: cannot find strong straight boundaries between ad and content."
+        )
+
+    candidates = multicolor_data["candidates"]
+    best_component = choose_multicolor_candidate(candidates, shape_hint)
+    if best_component is None:
+        raise NoAdsDetectedError(
+            "No ads dection: boundaries do not form a valid L, square, or rectangle ad."
+        )
+
+    component_mask = best_component["component_mask"]
+    inferred_shape = best_component["inferred_shape"]
+    edges = best_component["edges"]
+    edge_pair = best_component["edge_pair"]
+    rectangularity = best_component["rectangularity"]
+    resolved_shape = resolve_shape(shape_hint, inferred_shape)
+    bbox = best_component["bbox"]
+    area_pixels = best_component["area_pixels"]
+
+    area_percent = float(area_pixels) / float(image_width * image_height) * 100.0
+    if area_percent < MIN_AD_AREA_PERCENT:
+        raise NoAdsDetectedError(
+            f"No ads dection: detected ad area is below {MIN_AD_AREA_PERCENT:.0f}% of the frame."
+        )
+    if area_percent >= FULL_FRAME_AD_THRESHOLD_PERCENT:
+        raise NoAdsDetectedError(
+            "No ads dection: detected ad covers the whole frame."
+        )
+
+    result = {
+        "image_path": str(image_path),
+        "detected_color_hex": best_component["detected_color_hex"],
+        "shape": resolved_shape,
+        "inferred_shape": inferred_shape,
+        "bbox": bbox,
+        "area_pixels": int(area_pixels),
+        "area_percent": round(area_percent, 3),
+        "dimensions": build_dimensions(resolved_shape, bbox, edges, edge_pair),
+        "tolerance": tolerance,
+        "rectangularity": round(rectangularity, 4),
+        "selection_score": round(best_component["selection_score"], 3),
+        "ad_mode": "multicolor",
+        "boundary_count": multicolor_data["boundary_count"],
+    }
+
+    if shape_hint != "auto" and shape_hint != inferred_shape:
+        result["warning"] = (
+            f"Shape hint '{shape_hint}' differs from inferred shape '{inferred_shape}'."
+        )
+
+    render_data = {
+        "image_rgb": image_rgb,
+        "component_mask": component_mask,
+        "edge_pair": edge_pair,
+    }
+    return result, render_data
+
+
+def detect_ad(image_path, color_hint, shape_hint, tolerance, ad_mode):
+    if ad_mode == "multicolor":
+        return detect_ad_multicolor(
+            image_path=image_path,
+            shape_hint=shape_hint,
+            tolerance=tolerance,
+        )
+    return detect_ad_monochrome(
+        image_path=image_path,
+        color_hint=color_hint,
+        shape_hint=shape_hint,
+        tolerance=tolerance,
+    )
+
+
 def print_human_readable(result):
     print(f"Image: {result['image_path']}")
     print(f"Detected color: {result['detected_color_hex']}")
@@ -1252,7 +2033,7 @@ def print_human_readable(result):
         print(f"Warning: {result['warning']}")
 
 
-def process_single_image(image_path, color_hint, shape_hint, tolerance, output_path):
+def process_single_image(image_path, color_hint, shape_hint, tolerance, output_path, ad_mode):
     cleanup_output_variants(
         image_path=image_path,
         output_dir=output_path.parent,
@@ -1263,6 +2044,7 @@ def process_single_image(image_path, color_hint, shape_hint, tolerance, output_p
         color_hint=color_hint,
         shape_hint=shape_hint,
         tolerance=tolerance,
+        ad_mode=ad_mode,
     )
     save_annotated_image(
         image_rgb=render_data["image_rgb"],
@@ -1275,7 +2057,7 @@ def process_single_image(image_path, color_hint, shape_hint, tolerance, output_p
     return result
 
 
-def process_image_directory(source_dir, output_dir, color_hint, shape_hint, tolerance):
+def process_image_directory(source_dir, output_dir, color_hint, shape_hint, tolerance, ad_mode):
     if not source_dir.exists():
         raise FileNotFoundError(f"Input folder does not exist: {source_dir}")
     if not source_dir.is_dir():
@@ -1284,6 +2066,7 @@ def process_image_directory(source_dir, output_dir, color_hint, shape_hint, tole
     image_paths = find_source_files(source_dir, "images")
     summary = {
         "source": "images",
+        "ad_mode": ad_mode,
         "input_dir": str(source_dir),
         "output_dir": str(output_dir),
         "processed_count": len(image_paths),
@@ -1304,6 +2087,7 @@ def process_image_directory(source_dir, output_dir, color_hint, shape_hint, tole
                 shape_hint=shape_hint,
                 tolerance=tolerance,
                 output_path=output_path,
+                ad_mode=ad_mode,
             )
             summary["results"].append(result)
             summary["success_count"] += 1
@@ -1345,7 +2129,7 @@ def process_image_directory(source_dir, output_dir, color_hint, shape_hint, tole
     return summary
 
 
-def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tolerance, frame_interval_seconds):
+def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tolerance, frame_interval_seconds, ad_mode):
     if not source_dir.exists():
         raise FileNotFoundError(f"Input folder does not exist: {source_dir}")
     if not source_dir.is_dir():
@@ -1354,6 +2138,7 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
     video_paths = find_source_files(source_dir, "videos")
     summary = {
         "source": "videos",
+        "ad_mode": ad_mode,
         "input_dir": str(source_dir),
         "output_dir": str(output_dir),
         "frame_interval_seconds": frame_interval_seconds,
@@ -1384,6 +2169,7 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
                 "video_path": str(video_path),
                 "frames_dir": str(frames_dir),
                 "detections_dir": str(detections_dir),
+                "ad_mode": ad_mode,
                 "frame_interval_seconds": frame_interval_seconds,
                 "extracted_frame_count": len(extracted_frames),
                 "success_count": 0,
@@ -1404,6 +2190,7 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
                         shape_hint=shape_hint,
                         tolerance=tolerance,
                         output_path=output_path,
+                        ad_mode=ad_mode,
                     )
                     result["frame_index"] = frame_info["frame_index"]
                     result["timestamp_seconds"] = frame_info["timestamp_seconds"]
@@ -1451,6 +2238,11 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
                     )
 
             finish_progress(len(extracted_frames))
+            video_summary = refine_multicolor_video_results(
+                video_summary=video_summary,
+                shape_hint=shape_hint,
+                tolerance=tolerance,
+            )
             video_summary = apply_video_frame_warnings(video_summary)
             summary["videos"].append(video_summary)
             summary["total_extracted_frames"] += video_summary["extracted_frame_count"]
@@ -1481,6 +2273,7 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
 
 def print_image_batch_human_readable(summary):
     print(f"Source: {summary['source']}")
+    print(f"Ad mode: {summary['ad_mode']}")
     print(f"Input folder: {summary['input_dir']}")
     print(f"Output folder: {summary['output_dir']}")
     print(
@@ -1517,6 +2310,7 @@ def print_image_batch_human_readable(summary):
 
 def print_video_batch_human_readable(summary):
     print(f"Source: {summary['source']}")
+    print(f"Ad mode: {summary['ad_mode']}")
     print(f"Input folder: {summary['input_dir']}")
     print(f"Output folder: {summary['output_dir']}")
     print(f"Frame interval: {summary['frame_interval_seconds']} s")
@@ -1615,6 +2409,7 @@ def main():
             shape_hint=args.shape,
             tolerance=args.tolerance,
             frame_interval_seconds=args.frame_interval,
+            ad_mode=args.ad_mode,
         )
     else:
         summary = process_image_directory(
@@ -1623,6 +2418,7 @@ def main():
             color_hint=args.color,
             shape_hint=args.shape,
             tolerance=args.tolerance,
+            ad_mode=args.ad_mode,
         )
 
     if args.json:
