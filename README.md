@@ -57,7 +57,8 @@ Trong lúc script đang chạy, console sẽ hiển thị progress bar cho:
 
 - `--source`: bắt buộc, chọn `images` hoặc `videos`
 - `--ad-mode`: chọn mode detect ad
-  - `monochrome`: mặc định, dành cho ad đơn sắc
+  - nếu không truyền `--ad-mode`: script sẽ thử `monochrome` trước; nếu không detect ra ad thì tự fallback sang `multicolor`
+  - `monochrome`: ép detect theo mode ad đơn sắc
   - `multicolor`: dành cho ad đa sắc, detect theo boundary dọc/ngang
 - `--color`: màu ad ở dạng hex, ví dụ `#FFA223` hoặc `FFA223`
 - `--shape`: gợi ý shape cho ad: `auto`, `l`, `rectangle`, `square`
@@ -77,9 +78,12 @@ Một ảnh hoặc frame sẽ bị report `No ads dection` nếu rơi vào một
 
 - vùng detect không phải `L`, `square`, hoặc `rectangle`
 - tỷ lệ diện tích ad nhỏ hơn `5%`
-- vùng detect phủ gần như toàn bộ frame (`>= 99.5%`)
+- nếu ad có shape `L`, tỷ lệ diện tích không được lớn hơn `50%`
+- vùng detect phủ gần như toàn bộ frame (`>= 90%`)
 
 ## Multicolor Mode
+
+`multicolor` cũng là mode fallback khi không truyền `--ad-mode` và bước detect `monochrome` không tìm được ad.
 
 Khi chạy với `--ad-mode multicolor`, script sẽ:
 
@@ -90,8 +94,8 @@ Khi chạy với `--ad-mode multicolor`, script sẽ:
 
 Rule chọn ad trong `multicolor` mode:
 
-- nếu có object hình `L` thì ưu tiên object đó
-- nếu không có `L`, object nhỏ hơn trong các shape hợp lệ `rectangle/square` sẽ được xem là ad
+- nếu truyền `--shape l` thì chỉ ưu tiên object hình `L`
+- nếu để `--shape auto`, các shape hợp lệ `L`, `rectangle`, `square` sẽ được xét theo score, nhưng `L` có ưu tiên nhẹ
 - nếu không tìm được boundary đủ thẳng hoặc boundary không tạo được shape hợp lệ thì trả `No ads dection`
 
 ## Output

@@ -26,6 +26,7 @@ MIN_L_PAIR_SCORE = 0.35
 MIN_RECTANGULARITY_FOR_RECT = 0.9
 FULL_FRAME_AD_THRESHOLD_PERCENT = 90
 MIN_AD_AREA_PERCENT = 5.0
+MAX_L_AD_AREA_PERCENT = 50.0
 MULTICOLOR_BOUNDARY_MARGIN_RATIO = 0.05
 MULTICOLOR_BOUNDARY_MERGE_RATIO = 0.02
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -36,6 +37,21 @@ class NoAdsDetectedError(RuntimeError):
     def __init__(self, reason):
         super().__init__(reason)
         self.reason = reason
+
+
+def validate_ad_area_percent(area_percent, shape_name):
+    if area_percent < MIN_AD_AREA_PERCENT:
+        raise NoAdsDetectedError(
+            f"No ads dection: detected ad area is below {MIN_AD_AREA_PERCENT:.0f}% of the frame."
+        )
+    if shape_name == "l" and area_percent > MAX_L_AD_AREA_PERCENT:
+        raise NoAdsDetectedError(
+            f"No ads dection: detected L ad area is above {MAX_L_AD_AREA_PERCENT:.0f}% of the frame."
+        )
+    if area_percent >= FULL_FRAME_AD_THRESHOLD_PERCENT:
+        raise NoAdsDetectedError(
+            "No ads dection: detected ad covers the whole frame."
+        )
 
 
 def parse_args():
@@ -51,8 +67,10 @@ def parse_args():
     parser.add_argument(
         "--ad-mode",
         choices=["monochrome", "multicolor"],
-        default="monochrome",
-        help="Ad detection mode. monochrome is default; multicolor uses straight boundaries.",
+        help=(
+            "Ad detection mode. If omitted, try monochrome first and "
+            "fallback to multicolor when no ad is found."
+        ),
     )
     parser.add_argument(
         "--color",
@@ -447,11 +465,15 @@ def build_multicolor_candidates(image_rgb, shape_hint, tolerance):
     }
 
 
-def is_candidate_area_valid(area_pixels, image_area):
+def is_candidate_area_valid(area_pixels, image_area, shape_name=None):
     if image_area <= 0:
         return True
     area_percent = float(area_pixels) / float(image_area) * 100.0
-    return MIN_AD_AREA_PERCENT <= area_percent < FULL_FRAME_AD_THRESHOLD_PERCENT
+    if area_percent < MIN_AD_AREA_PERCENT or area_percent >= FULL_FRAME_AD_THRESHOLD_PERCENT:
+        return False
+    if shape_name == "l" and area_percent > MAX_L_AD_AREA_PERCENT:
+        return False
+    return True
 
 
 def choose_multicolor_candidate(candidates, shape_hint, image_area=None):
@@ -462,15 +484,28 @@ def choose_multicolor_candidate(candidates, shape_hint, image_area=None):
         valid_candidates = [
             candidate
             for candidate in candidates
-            if is_candidate_area_valid(candidate["area_pixels"], image_area)
+            if is_candidate_area_valid(
+                candidate["area_pixels"],
+                image_area,
+                shape_name=candidate["inferred_shape"],
+            )
         ]
         if valid_candidates:
             candidates = valid_candidates
 
-    l_candidates = [candidate for candidate in candidates if candidate["inferred_shape"] == "l"]
-    rect_candidates = [candidate for candidate in candidates if candidate["inferred_shape"] in {"rectangle", "square"}]
+    rect_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["inferred_shape"] in {"rectangle", "square"}
+    ]
 
-    if shape_hint in {"auto", "l"} and l_candidates:
+    if shape_hint == "l":
+        l_candidates = [
+            candidate for candidate in candidates if candidate["inferred_shape"] == "l"
+        ]
+        if not l_candidates:
+            return None
+
         def l_horizontal_arm_penalty(candidate):
             edge_a, edge_b = normalize_l_pair(candidate["edge_pair"])
             horizontal_edge = edge_a if edge_a in ("top", "bottom") else edge_b
@@ -489,25 +524,42 @@ def choose_multicolor_candidate(candidates, shape_hint, image_area=None):
                 candidate["area_pixels"],
             ),
         )
-        
-        # For auto mode, compare best L-shape with rectangles
-        # Prefer rectangles if they have significantly better boundary scores
-        # or if they are thin (aspect ratio > 3:1), which is typical for banner ads
-        if shape_hint == "auto" and rect_candidates:
-            best_rect = max(
-                rect_candidates,
-                key=lambda candidate: candidate["boundary_score"]
-            )
-            bbox_width = best_rect["bbox"]["width"]
-            bbox_height = best_rect["bbox"]["height"]
-            aspect_ratio = max(bbox_width, bbox_height) / float(min(bbox_width, bbox_height))
-            
-            # Prefer rectangle if it has comparable or better boundary score
-            # and has extreme aspect ratio (thin rectangle/banner)
-            if aspect_ratio > 3.0 and best_rect["boundary_score"] >= best_l["boundary_score"] * 0.8:
-                return best_rect
-        
         return best_l
+
+    if shape_hint == "auto":
+        l_candidates = [
+            candidate for candidate in candidates if candidate["inferred_shape"] == "l"
+        ]
+        if l_candidates and rect_candidates:
+            best_l = max(
+                l_candidates,
+                key=lambda candidate: (
+                    candidate["boundary_score"] + 0.1 + (0.15 * candidate.get("l_balance_score", 0.0))
+                ),
+            )
+            slender_rect_candidates = []
+            for candidate in rect_candidates:
+                bbox_width = candidate["bbox"]["width"]
+                bbox_height = candidate["bbox"]["height"]
+                aspect_ratio = max(bbox_width, bbox_height) / float(min(bbox_width, bbox_height))
+                if aspect_ratio > 2.2:
+                    slender_rect_candidates.append((aspect_ratio, candidate))
+
+            if slender_rect_candidates:
+                _, best_rect = min(
+                    slender_rect_candidates,
+                    key=lambda item: (
+                        -item[1]["boundary_score"],
+                        item[1]["area_pixels"],
+                    ),
+                )
+                best_l_area = max(float(best_l["area_pixels"]), 1.0)
+                rect_area_ratio = best_rect["area_pixels"] / best_l_area
+                if (
+                    rect_area_ratio <= 0.7
+                    and best_rect["boundary_score"] >= best_l["boundary_score"] * 0.82
+                ):
+                    return best_rect
 
     def priority(candidate):
         inferred_shape = candidate["inferred_shape"]
@@ -527,7 +579,10 @@ def choose_multicolor_candidate(candidates, shape_hint, image_area=None):
             is_match = inferred_shape in {"rectangle", "square"}
             return (0 if is_match else 1, -boundary_score, area_pixels)
 
-        return (1, area_pixels, -boundary_score)
+        effective_score = boundary_score
+        if inferred_shape == "l":
+            effective_score += 0.1 + (0.15 * l_balance_score)
+        return (-effective_score, area_pixels)
 
     return min(candidates, key=priority)
 
@@ -610,11 +665,21 @@ def choose_multicolor_candidate_with_reference(candidates, shape_hint, reference
     if reference is None:
         return choose_multicolor_candidate(candidates, shape_hint, image_area=image_area)
 
+    base_choice = choose_multicolor_candidate(candidates, shape_hint, image_area=image_area)
+    if shape_hint == "auto" and (
+        base_choice is None or base_choice["inferred_shape"] != "l"
+    ):
+        return base_choice
+
     if image_area is not None:
         valid_candidates = [
             candidate
             for candidate in candidates
-            if is_candidate_area_valid(candidate["area_pixels"], image_area)
+            if is_candidate_area_valid(
+                candidate["area_pixels"],
+                image_area,
+                shape_name=candidate["inferred_shape"],
+            )
         ]
         if valid_candidates:
             candidates = valid_candidates
@@ -1323,6 +1388,24 @@ def apply_video_frame_warnings(video_summary):
                 if flagged_output_path.exists():
                     flagged_output_path.unlink()
                 current_output_path.replace(flagged_output_path)
+            image_rgb = load_image_rgb(result["image_path"])
+            component_mask = build_component_mask_from_result(result, image_rgb.shape)
+            edge_pair = None
+            if result["shape"] == "l":
+                corner_to_edge_pair = {
+                    "bottom-left": ("left", "bottom"),
+                    "bottom-right": ("right", "bottom"),
+                    "top-left": ("left", "top"),
+                    "top-right": ("right", "top"),
+                }
+                edge_pair = corner_to_edge_pair[result["dimensions"]["corner"]]
+            save_annotated_image(
+                image_rgb=image_rgb,
+                component_mask=component_mask,
+                result=result,
+                edge_pair=edge_pair,
+                output_path=flagged_output_path,
+            )
             result["output_image_path"] = str(flagged_output_path)
             video_summary["warning_count"] += 1
         else:
@@ -1357,18 +1440,21 @@ def rebuild_multicolor_result(image_path, shape_hint, tolerance, reference):
     bbox = best_component["bbox"]
     area_pixels = best_component["area_pixels"]
     area_percent = float(area_pixels) / float(image_width * image_height) * 100.0
-    if area_percent < MIN_AD_AREA_PERCENT or area_percent >= FULL_FRAME_AD_THRESHOLD_PERCENT:
+    resolved_shape = resolve_shape(shape_hint, inferred_shape)
+    try:
+        validate_ad_area_percent(area_percent, resolved_shape)
+    except NoAdsDetectedError:
         return None
 
     result = {
         "image_path": str(image_path),
         "detected_color_hex": best_component["detected_color_hex"],
-        "shape": resolve_shape(shape_hint, inferred_shape),
+        "shape": resolved_shape,
         "inferred_shape": inferred_shape,
         "bbox": bbox,
         "area_pixels": int(area_pixels),
         "area_percent": round(area_percent, 3),
-        "dimensions": build_dimensions(resolve_shape(shape_hint, inferred_shape), bbox, best_component["edges"], edge_pair),
+        "dimensions": build_dimensions(resolved_shape, bbox, best_component["edges"], edge_pair),
         "tolerance": tolerance,
         "rectangularity": round(best_component["rectangularity"], 4),
         "selection_score": round(best_component["selection_score"], 3),
@@ -1469,7 +1555,10 @@ def snap_multicolor_result_to_l_reference(result, reference):
 
 
 def refine_multicolor_video_results(video_summary, shape_hint, tolerance):
-    if video_summary.get("ad_mode") != "multicolor":
+    has_multicolor_results = any(
+        result.get("ad_mode") == "multicolor" for result in video_summary["results"]
+    )
+    if not has_multicolor_results:
         return video_summary
 
     corner_reference = build_multicolor_l_reference(video_summary["results"])
@@ -1662,6 +1751,39 @@ def apply_mask_overlay(image_bgr, component_mask, color_bgr, alpha=0.28):
     ).astype(np.uint8)
 
 
+def build_component_mask_from_result(result, image_shape):
+    image_height, image_width = image_shape[:2]
+    mask = np.zeros((image_height, image_width), dtype=bool)
+
+    if result["shape"] == "l":
+        dimensions = result["dimensions"]
+        corner = dimensions["corner"]
+        horizontal_height = (
+            dimensions["bottom_arm"]["height_px"]
+            if "bottom_arm" in dimensions
+            else dimensions["top_arm"]["height_px"]
+        )
+        vertical_width = (
+            dimensions["left_arm"]["width_px"]
+            if "left_arm" in dimensions
+            else dimensions["right_arm"]["width_px"]
+        )
+        return l_mask_from_reference(
+            image_shape=image_shape,
+            corner=corner,
+            vertical_width=int(round(vertical_width)),
+            horizontal_height=int(round(horizontal_height)),
+        )
+
+    bbox = result["bbox"]
+    x = bbox["x"]
+    y = bbox["y"]
+    width = bbox["width"]
+    height = bbox["height"]
+    mask[y : y + height, x : x + width] = True
+    return mask
+
+
 def draw_component_contours(image_bgr, component_mask, color_bgr):
     contour_mask = (component_mask.astype(np.uint8)) * 255
     contours, _ = cv2.findContours(contour_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1828,8 +1950,17 @@ def draw_l_dimensions(image_bgr, bbox, edge_pair, dimensions, border_color_bgr):
 def save_annotated_image(image_rgb, component_mask, result, edge_pair, output_path):
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     border_color_bgr = choose_annotation_color(parse_hex_color(result["detected_color_hex"]))
+    overlay_alpha = 0.28
+    if result.get("is_warning"):
+        border_color_bgr = (0, 0, 255)
+        overlay_alpha = 0.45
 
-    apply_mask_overlay(image_bgr, component_mask, color_bgr=border_color_bgr)
+    apply_mask_overlay(
+        image_bgr,
+        component_mask,
+        color_bgr=border_color_bgr,
+        alpha=overlay_alpha,
+    )
     draw_component_contours(image_bgr, component_mask, color_bgr=border_color_bgr)
 
     if result["shape"] == "l":
@@ -1898,14 +2029,7 @@ def detect_ad_monochrome(image_path, color_hint, shape_hint, tolerance):
         "height": int(height),
     }
     area_percent = float(area_pixels) / float(image_width * image_height) * 100.0
-    if area_percent < MIN_AD_AREA_PERCENT:
-        raise NoAdsDetectedError(
-            f"No ads dection: detected ad area is below {MIN_AD_AREA_PERCENT:.0f}% of the frame."
-        )
-    if area_percent >= FULL_FRAME_AD_THRESHOLD_PERCENT:
-        raise NoAdsDetectedError(
-            "No ads dection: detected ad covers the whole frame."
-        )
+    validate_ad_area_percent(area_percent, resolved_shape)
     result = {
         "image_path": str(image_path),
         "detected_color_hex": rgb_to_hex(best_component["color_rgb"]),
@@ -1972,14 +2096,7 @@ def detect_ad_multicolor(image_path, shape_hint, tolerance):
     area_pixels = best_component["area_pixels"]
 
     area_percent = float(area_pixels) / float(image_width * image_height) * 100.0
-    if area_percent < MIN_AD_AREA_PERCENT:
-        raise NoAdsDetectedError(
-            f"No ads dection: detected ad area is below {MIN_AD_AREA_PERCENT:.0f}% of the frame."
-        )
-    if area_percent >= FULL_FRAME_AD_THRESHOLD_PERCENT:
-        raise NoAdsDetectedError(
-            "No ads dection: detected ad covers the whole frame."
-        )
+    validate_ad_area_percent(area_percent, resolved_shape)
 
     result = {
         "image_path": str(image_path),
@@ -2017,12 +2134,33 @@ def detect_ad(image_path, color_hint, shape_hint, tolerance, ad_mode):
             shape_hint=shape_hint,
             tolerance=tolerance,
         )
-    return detect_ad_monochrome(
-        image_path=image_path,
-        color_hint=color_hint,
-        shape_hint=shape_hint,
-        tolerance=tolerance,
-    )
+    if ad_mode == "monochrome":
+        return detect_ad_monochrome(
+            image_path=image_path,
+            color_hint=color_hint,
+            shape_hint=shape_hint,
+            tolerance=tolerance,
+        )
+
+    try:
+        return detect_ad_monochrome(
+            image_path=image_path,
+            color_hint=color_hint,
+            shape_hint=shape_hint,
+            tolerance=tolerance,
+        )
+    except NoAdsDetectedError:
+        return detect_ad_multicolor(
+            image_path=image_path,
+            shape_hint=shape_hint,
+            tolerance=tolerance,
+        )
+
+
+def format_ad_mode_label(ad_mode):
+    if ad_mode is None:
+        return "auto (monochrome -> multicolor fallback)"
+    return ad_mode
 
 
 def print_human_readable(result):
@@ -2304,7 +2442,7 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
 
 def print_image_batch_human_readable(summary):
     print(f"Source: {summary['source']}")
-    print(f"Ad mode: {summary['ad_mode']}")
+    print(f"Ad mode: {format_ad_mode_label(summary['ad_mode'])}")
     print(f"Input folder: {summary['input_dir']}")
     print(f"Output folder: {summary['output_dir']}")
     print(
@@ -2341,7 +2479,7 @@ def print_image_batch_human_readable(summary):
 
 def print_video_batch_human_readable(summary):
     print(f"Source: {summary['source']}")
-    print(f"Ad mode: {summary['ad_mode']}")
+    print(f"Ad mode: {format_ad_mode_label(summary['ad_mode'])}")
     print(f"Input folder: {summary['input_dir']}")
     print(f"Output folder: {summary['output_dir']}")
     print(f"Frame interval: {summary['frame_interval_seconds']} s")
