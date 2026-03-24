@@ -24,7 +24,7 @@ WARNING_DIMENSION_RELATIVE_TOLERANCE = 0.03
 WARNING_DIMENSION_ABSOLUTE_TOLERANCE_PX = 6
 MIN_L_PAIR_SCORE = 0.35
 MIN_RECTANGULARITY_FOR_RECT = 0.9
-FULL_FRAME_AD_THRESHOLD_PERCENT = 99.5
+FULL_FRAME_AD_THRESHOLD_PERCENT = 90
 MIN_AD_AREA_PERCENT = 5.0
 MULTICOLOR_BOUNDARY_MARGIN_RATIO = 0.05
 MULTICOLOR_BOUNDARY_MERGE_RATIO = 0.02
@@ -447,9 +447,25 @@ def build_multicolor_candidates(image_rgb, shape_hint, tolerance):
     }
 
 
-def choose_multicolor_candidate(candidates, shape_hint):
+def is_candidate_area_valid(area_pixels, image_area):
+    if image_area <= 0:
+        return True
+    area_percent = float(area_pixels) / float(image_area) * 100.0
+    return MIN_AD_AREA_PERCENT <= area_percent < FULL_FRAME_AD_THRESHOLD_PERCENT
+
+
+def choose_multicolor_candidate(candidates, shape_hint, image_area=None):
     if not candidates:
         return None
+
+    if image_area is not None:
+        valid_candidates = [
+            candidate
+            for candidate in candidates
+            if is_candidate_area_valid(candidate["area_pixels"], image_area)
+        ]
+        if valid_candidates:
+            candidates = valid_candidates
 
     l_candidates = [candidate for candidate in candidates if candidate["inferred_shape"] == "l"]
     rect_candidates = [candidate for candidate in candidates if candidate["inferred_shape"] in {"rectangle", "square"}]
@@ -590,13 +606,22 @@ def build_stable_multicolor_l_reference(results):
     )
 
 
-def choose_multicolor_candidate_with_reference(candidates, shape_hint, reference):
+def choose_multicolor_candidate_with_reference(candidates, shape_hint, reference, image_area=None):
     if reference is None:
-        return choose_multicolor_candidate(candidates, shape_hint)
+        return choose_multicolor_candidate(candidates, shape_hint, image_area=image_area)
+
+    if image_area is not None:
+        valid_candidates = [
+            candidate
+            for candidate in candidates
+            if is_candidate_area_valid(candidate["area_pixels"], image_area)
+        ]
+        if valid_candidates:
+            candidates = valid_candidates
 
     l_candidates = [candidate for candidate in candidates if candidate["inferred_shape"] == "l"]
     if shape_hint not in {"auto", "l"} or not l_candidates:
-        return choose_multicolor_candidate(candidates, shape_hint)
+        return choose_multicolor_candidate(candidates, shape_hint, image_area=image_area)
 
     def reference_distance(candidate):
         dims = build_l_dimensions_from_candidate(candidate)
@@ -1309,6 +1334,8 @@ def apply_video_frame_warnings(video_summary):
 
 def rebuild_multicolor_result(image_path, shape_hint, tolerance, reference):
     image_rgb = load_image_rgb(image_path)
+    image_height, image_width = image_rgb.shape[:2]
+    image_area = image_width * image_height
     multicolor_data = build_multicolor_candidates(
         image_rgb=image_rgb,
         shape_hint=shape_hint,
@@ -1319,12 +1346,11 @@ def rebuild_multicolor_result(image_path, shape_hint, tolerance, reference):
         candidates=candidates,
         shape_hint=shape_hint,
         reference=reference,
+        image_area=image_area,
     )
     if best_component is None:
         return None
 
-    image_width = image_rgb.shape[1]
-    image_height = image_rgb.shape[0]
     component_mask = best_component["component_mask"]
     inferred_shape = best_component["inferred_shape"]
     edge_pair = best_component["edge_pair"]
@@ -1911,6 +1937,7 @@ def detect_ad_multicolor(image_path, shape_hint, tolerance):
     image_rgb = load_image_rgb(image_path)
     image_width = image_rgb.shape[1]
     image_height = image_rgb.shape[0]
+    image_area = image_width * image_height
 
     multicolor_data = build_multicolor_candidates(
         image_rgb=image_rgb,
@@ -1925,7 +1952,11 @@ def detect_ad_multicolor(image_path, shape_hint, tolerance):
         )
 
     candidates = multicolor_data["candidates"]
-    best_component = choose_multicolor_candidate(candidates, shape_hint)
+    best_component = choose_multicolor_candidate(
+        candidates,
+        shape_hint,
+        image_area=image_area,
+    )
     if best_component is None:
         raise NoAdsDetectedError(
             "No ads dection: boundaries do not form a valid L, square, or rectangle ad."
