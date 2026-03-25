@@ -28,7 +28,7 @@ python detect_ad.py --source images
 
 ### Chạy với video
 
-Mặc định script sẽ trích `2 giây / 1 frame`, sau đó detect toàn bộ frame.
+Mặc định script sẽ trích `2 giây / 1 frame`, sau đó detect toàn bộ frame và lưu ảnh kết quả theo cơ chế cũ.
 
 ```bash
 python detect_ad.py --source videos
@@ -39,6 +39,20 @@ Nếu muốn đổi chu kỳ trích frame:
 ```bash
 python detect_ad.py --source videos --frame-interval 1.5
 ```
+
+Nếu muốn detect trực tiếp trên luồng video và xuất ra video đã được vẽ mark:
+
+```bash
+python detect_ad.py --source videos --output-format videos
+```
+
+Với `--output-format videos`, script sẽ giữ nguyên FPS của video gốc, nhưng để tăng tốc:
+
+- chỉ detect mỗi `N` frame
+- reuse kết quả detect cho các frame ở giữa
+- detect trên frame đã được downscale
+
+Tham số `--frame-interval` không được áp dụng trong mode này.
 
 ### In kết quả dạng JSON
 
@@ -63,7 +77,12 @@ Trong lúc script đang chạy, console sẽ hiển thị progress bar cho:
 - `--color`: màu ad ở dạng hex, ví dụ `#FFA223` hoặc `FFA223`
 - `--shape`: gợi ý shape cho ad: `auto`, `l`, `rectangle`, `square`
 - `--tolerance`: độ lệch màu tối đa khi tạo mask, mặc định `20`
-- `--frame-interval`: chỉ dùng cho `--source videos`, mặc định `2.0`
+- `--frame-interval`: chỉ dùng cho `--source videos --output-format frames`, mặc định `2.0`
+- `--output-format`: chỉ dùng cho `--source videos`
+  - `frames`: mặc định, dùng cơ chế cũ: trích frame rồi detect từng frame
+  - `videos`: detect trực tiếp trên toàn bộ luồng video, giữ nguyên FPS gốc và xuất video đã được vẽ mark
+- `--video-detect-every`: chỉ dùng cho `--source videos --output-format videos`, số frame giữa hai lần detect thật, mặc định `5`
+- `--video-detect-scale`: chỉ dùng cho `--source videos --output-format videos`, tỉ lệ resize trước khi detect, mặc định `0.5`
 - `--json`: in kết quả dạng JSON
 
 ## Rule detect
@@ -113,6 +132,16 @@ Với mỗi video trong `input/videos`, script sẽ:
 3. Ghi kết quả vào `output/videos/<ten_video>/detections`
 4. So sánh các frame detect thành công để tìm frame khác biệt
 
+Nếu chạy với `--output-format videos`, script sẽ:
+
+1. Đọc toàn bộ frame của video
+2. Detect thật mỗi `N` frame trên ảnh đã downscale
+3. Reuse kết quả detect gần nhất cho các frame ở giữa
+4. Vẽ mark lên từng frame ở kích thước gốc
+5. Ghi ra video kết quả với FPS gốc tại `output/videos/<ten_video>/<ten_video>_detected.*`
+
+Ở mode này, script không trích frame ra folder `frames/` và không tạo folder `detections/`.
+
 ## Quy tắc đặt tên file trong `detections`
 
 - nếu có ad bình thường: filename kết thúc bằng `_detected.png`
@@ -159,6 +188,8 @@ Khi một frame bị warning:
 python detect_ad.py --source images --shape rectangle
 python detect_ad.py --source images --color BB281A --shape rectangle --tolerance 15
 python detect_ad.py --source videos --shape l --frame-interval 2
+python detect_ad.py --source videos --output-format videos
+python detect_ad.py --source videos --output-format videos --video-detect-every 6 --video-detect-scale 0.5
 ```
 
 ## Ghi chú

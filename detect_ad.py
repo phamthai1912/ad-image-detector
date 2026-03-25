@@ -15,6 +15,8 @@ MIN_EDGE_RATIO = 0.01
 DEFAULT_INPUT_DIR = "input"
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_FRAME_INTERVAL_SECONDS = 2.0
+DEFAULT_VIDEO_DETECT_EVERY_N_FRAMES = 5
+DEFAULT_VIDEO_DETECT_SCALE = 0.5
 PROGRESS_BAR_WIDTH = 28
 WARNING_MIN_FRAMES = 3
 WARNING_STABLE_GROUP_MIN_FRAMES = 3
@@ -97,7 +99,38 @@ def parse_args():
         "--frame-interval",
         type=float,
         default=DEFAULT_FRAME_INTERVAL_SECONDS,
-        help=f"Frame capture interval in seconds for video mode. Default: {DEFAULT_FRAME_INTERVAL_SECONDS}",
+        help=(
+            "Frame capture interval in seconds for --source videos --output-format frames. "
+            f"Default: {DEFAULT_FRAME_INTERVAL_SECONDS}"
+        ),
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=["frames", "videos"],
+        default="frames",
+        help=(
+            "Output format for video source. frames keeps the current extracted-frame "
+            "workflow; videos keeps the original FPS, detects every N frames, "
+            "reuses the latest result between them, and writes marked videos."
+        ),
+    )
+    parser.add_argument(
+        "--video-detect-every",
+        type=int,
+        default=DEFAULT_VIDEO_DETECT_EVERY_N_FRAMES,
+        help=(
+            "Only for --source videos --output-format videos. Run full detection every N "
+            f"frames and reuse the latest result between them. Default: {DEFAULT_VIDEO_DETECT_EVERY_N_FRAMES}"
+        ),
+    )
+    parser.add_argument(
+        "--video-detect-scale",
+        type=float,
+        default=DEFAULT_VIDEO_DETECT_SCALE,
+        help=(
+            "Only for --source videos --output-format videos. Downscale factor used for detection. "
+            f"Default: {DEFAULT_VIDEO_DETECT_SCALE}"
+        ),
     )
     return parser.parse_args()
 
@@ -126,6 +159,87 @@ def load_image_rgb(image_path):
     if image.shape[2] == 4:
         return cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def ensure_image_label(image_label):
+    if image_label is None:
+        return "<memory>"
+    return str(image_label)
+
+
+def resize_image_for_detection(image_rgb, detect_scale):
+    detect_scale = float(detect_scale)
+    if detect_scale <= 0:
+        raise ValueError("--video-detect-scale must be greater than 0.")
+    if detect_scale >= 1.0:
+        return image_rgb, 1.0
+
+    image_height, image_width = image_rgb.shape[:2]
+    resized_width = max(1, int(round(image_width * detect_scale)))
+    resized_height = max(1, int(round(image_height * detect_scale)))
+    resized = cv2.resize(
+        image_rgb,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    return resized, detect_scale
+
+
+def scale_bbox(bbox, scale_x, scale_y, image_width, image_height):
+    x = int(round(bbox["x"] * scale_x))
+    y = int(round(bbox["y"] * scale_y))
+    width = int(round(bbox["width"] * scale_x))
+    height = int(round(bbox["height"] * scale_y))
+    x = clamp(x, 0, max(0, image_width - 1))
+    y = clamp(y, 0, max(0, image_height - 1))
+    width = clamp(width, 1, max(1, image_width - x))
+    height = clamp(height, 1, max(1, image_height - y))
+    return {
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+    }
+
+
+def scale_result_to_image(result, source_image_shape, target_image_shape):
+    source_height, source_width = source_image_shape[:2]
+    image_height, image_width = target_image_shape[:2]
+    scale_x = image_width / float(source_width)
+    scale_y = image_height / float(source_height)
+
+    scaled_result = dict(result)
+    scaled_result["bbox"] = scale_bbox(
+        result["bbox"],
+        scale_x=scale_x,
+        scale_y=scale_y,
+        image_width=image_width,
+        image_height=image_height,
+    )
+    scaled_result["area_pixels"] = int(round(result["area_pixels"] * scale_x * scale_y))
+    scaled_result["area_percent"] = round(
+        float(scaled_result["area_pixels"]) / float(image_width * image_height) * 100.0,
+        3,
+    )
+
+    dimensions = dict(result["dimensions"])
+    if result["shape"] == "l":
+        scaled_dimensions = {"corner": dimensions["corner"]}
+        for arm_name, arm_size in dimensions.items():
+            if arm_name == "corner":
+                continue
+            scaled_dimensions[arm_name] = {
+                "width_px": int(round(arm_size["width_px"] * scale_x)),
+                "height_px": int(round(arm_size["height_px"] * scale_y)),
+            }
+        scaled_result["dimensions"] = scaled_dimensions
+    else:
+        scaled_result["dimensions"] = {
+            "width_px": scaled_result["bbox"]["width"],
+            "height_px": scaled_result["bbox"]["height"],
+        }
+
+    return scaled_result
 
 
 def get_border_pixels(image_rgb):
@@ -1006,6 +1120,10 @@ def output_source_dir(source_name):
     return Path(DEFAULT_OUTPUT_DIR) / source_name
 
 
+def output_video_path(video_path, output_dir):
+    return output_dir / f"{video_path.stem}_detected{video_path.suffix}"
+
+
 def detection_output_path(image_path, output_dir):
     return output_dir / f"{image_path.stem}_detected.png"
 
@@ -1140,6 +1258,289 @@ def extract_frames_from_video(video_path, frames_dir, frame_interval_seconds):
         raise RuntimeError(f"No frames extracted from video: {video_path}")
 
     return extracted_frames
+
+
+def create_video_writer(output_path, fps, frame_width, frame_height):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fourcc_candidates = [
+        ("mp4v", ".mp4"),
+        ("XVID", ".avi"),
+        ("MJPG", ".avi"),
+    ]
+    suffix = output_path.suffix.lower()
+
+    for fourcc_name, recommended_suffix in fourcc_candidates:
+        candidate_path = output_path
+        if recommended_suffix != suffix:
+            candidate_path = output_path.with_suffix(recommended_suffix)
+        writer = cv2.VideoWriter(
+            str(candidate_path),
+            cv2.VideoWriter_fourcc(*fourcc_name),
+            float(max(fps, 0.1)),
+            (int(frame_width), int(frame_height)),
+        )
+        if writer.isOpened():
+            return writer, candidate_path
+        writer.release()
+
+    raise RuntimeError(f"Cannot create output video writer for: {output_path}")
+
+
+def process_video_directory_streaming(
+    source_dir,
+    output_dir,
+    color_hint,
+    shape_hint,
+    tolerance,
+    ad_mode,
+    video_detect_every,
+    video_detect_scale,
+):
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Input folder does not exist: {source_dir}")
+    if not source_dir.is_dir():
+        raise NotADirectoryError(f"Input path is not a folder: {source_dir}")
+
+    video_paths = find_source_files(source_dir, "videos")
+    if video_detect_every <= 0:
+        raise ValueError("--video-detect-every must be greater than 0.")
+    summary = {
+        "source": "videos",
+        "output_format": "videos",
+        "ad_mode": ad_mode,
+        "input_dir": str(source_dir),
+        "output_dir": str(output_dir),
+        "frame_interval_seconds": None,
+        "video_detect_every": video_detect_every,
+        "video_detect_scale": video_detect_scale,
+        "processed_count": len(video_paths),
+        "success_count": 0,
+        "error_count": 0,
+        "total_extracted_frames": 0,
+        "total_detected_frames": 0,
+        "total_no_detection_frames": 0,
+        "total_frame_errors": 0,
+        "total_warning_frames": 0,
+        "videos": [],
+        "errors": [],
+    }
+
+    for video_path in video_paths:
+        capture = None
+        writer = None
+        try:
+            capture = cv2.VideoCapture(str(video_path))
+            if not capture.isOpened():
+                raise RuntimeError(f"Cannot open video: {video_path}")
+
+            fps = capture.get(cv2.CAP_PROP_FPS)
+            if fps <= 0:
+                fps = 30.0
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            output_path = output_video_path(video_path, output_dir / video_path.stem)
+            writer, resolved_output_path = create_video_writer(
+                output_path=output_path,
+                fps=fps,
+                frame_width=frame_width,
+                frame_height=frame_height,
+            )
+
+            video_summary = {
+                "video_path": str(video_path),
+                "output_video_path": str(resolved_output_path),
+                "ad_mode": ad_mode,
+                "output_format": "videos",
+                "frame_interval_seconds": None,
+                "video_fps": round(float(fps), 3),
+                "video_detect_every": video_detect_every,
+                "video_detect_scale": video_detect_scale,
+                "extracted_frame_count": 0,
+                "success_count": 0,
+                "no_detection_count": 0,
+                "error_count": 0,
+                "warning_count": 0,
+                "no_detections": [],
+                "results": [],
+                "errors": [],
+            }
+
+            capture_index = 0
+            last_render_state = None
+
+            while True:
+                ok, frame_bgr = capture.read()
+                if not ok:
+                    break
+
+                timestamp_seconds = capture_index / float(max(fps, 1e-6))
+                frame_name = (
+                    f"{video_path.stem}_frame_{video_summary['extracted_frame_count']:04d}"
+                    f"_t{format_timestamp_tag(timestamp_seconds)}s"
+                )
+                image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                should_detect = (
+                    last_render_state is None
+                    or capture_index % int(video_detect_every) == 0
+                )
+
+                try:
+                    if should_detect:
+                        detect_image_rgb, applied_scale = resize_image_for_detection(
+                            image_rgb=image_rgb,
+                            detect_scale=video_detect_scale,
+                        )
+                        result, _ = detect_ad_from_rgb(
+                            image_rgb=detect_image_rgb,
+                            image_label=frame_name,
+                            color_hint=color_hint,
+                            shape_hint=shape_hint,
+                            tolerance=tolerance,
+                            ad_mode=ad_mode,
+                        )
+                        if applied_scale != 1.0:
+                            result = scale_result_to_image(
+                                result=result,
+                                source_image_shape=detect_image_rgb.shape,
+                                target_image_shape=image_rgb.shape,
+                            )
+                            result["image_path"] = frame_name
+                        last_render_state = {
+                            "mode": "detected",
+                            "result": result,
+                        }
+
+                    if last_render_state["mode"] == "detected":
+                        render_result = dict(last_render_state["result"])
+                        render_result["frame_index"] = capture_index
+                        render_result["timestamp_seconds"] = round(timestamp_seconds, 3)
+                        render_result["image_path"] = frame_name
+                        component_mask = build_component_mask_from_result(render_result, image_rgb.shape)
+                        edge_pair = None
+                        if render_result["shape"] == "l":
+                            corner_to_edge_pair = {
+                                "bottom-left": ("left", "bottom"),
+                                "bottom-right": ("right", "bottom"),
+                                "top-left": ("left", "top"),
+                                "top-right": ("right", "top"),
+                            }
+                            edge_pair = corner_to_edge_pair[render_result["dimensions"]["corner"]]
+                        annotated_bgr = render_annotated_image(
+                            image_rgb=image_rgb,
+                            component_mask=component_mask,
+                            result=render_result,
+                            edge_pair=edge_pair,
+                        )
+                        writer.write(annotated_bgr)
+                        video_summary["results"].append(render_result)
+                        video_summary["success_count"] += 1
+                    else:
+                        no_ad_reason = last_render_state["reason"]
+                        no_ad_result = {
+                            "frame_path": frame_name,
+                            "frame_index": capture_index,
+                            "timestamp_seconds": round(timestamp_seconds, 3),
+                            "report": "No ads dection",
+                            "reason": no_ad_reason,
+                        }
+                        video_summary["no_detections"].append(no_ad_result)
+                        video_summary["no_detection_count"] += 1
+                        image_width = frame_bgr.shape[1]
+                        image_height = frame_bgr.shape[0]
+                        draw_text_box(
+                            image_bgr=frame_bgr,
+                            text="No ads dection",
+                            center=(image_width // 2, max(32, image_height // 2)),
+                            max_width=max(180, int(round(image_width * 0.7))),
+                            max_height=max(40, int(round(image_height * 0.18))),
+                            border_color_bgr=(0, 0, 255),
+                            background_color_bgr=(32, 32, 32),
+                        )
+                        writer.write(frame_bgr)
+                except NoAdsDetectedError as exc:
+                    last_render_state = {
+                        "mode": "no_ad",
+                        "reason": exc.reason,
+                    }
+                    no_ad_result = {
+                        "frame_path": frame_name,
+                        "frame_index": capture_index,
+                        "timestamp_seconds": round(timestamp_seconds, 3),
+                        "report": "No ads dection",
+                        "reason": exc.reason,
+                    }
+                    video_summary["no_detections"].append(no_ad_result)
+                    video_summary["no_detection_count"] += 1
+                    image_width = frame_bgr.shape[1]
+                    image_height = frame_bgr.shape[0]
+                    draw_text_box(
+                        image_bgr=frame_bgr,
+                        text="No ads dection",
+                        center=(image_width // 2, max(32, image_height // 2)),
+                        max_width=max(180, int(round(image_width * 0.7))),
+                        max_height=max(40, int(round(image_height * 0.18))),
+                        border_color_bgr=(0, 0, 255),
+                        background_color_bgr=(32, 32, 32),
+                    )
+                    writer.write(frame_bgr)
+                except Exception as exc:
+                    last_render_state = None
+                    video_summary["errors"].append(
+                        {
+                            "frame_index": capture_index,
+                            "timestamp_seconds": round(timestamp_seconds, 3),
+                            "error": str(exc),
+                        }
+                    )
+                    video_summary["error_count"] += 1
+                    writer.write(frame_bgr)
+
+                video_summary["extracted_frame_count"] += 1
+                processed_frames = (
+                    video_summary["success_count"]
+                    + video_summary["no_detection_count"]
+                    + video_summary["error_count"]
+                )
+                estimated_total = (
+                    frame_count if frame_count > 0 else processed_frames
+                )
+                print_progress(
+                    label=f"Detecting {video_path.stem}",
+                    current=processed_frames,
+                    total=estimated_total,
+                )
+                capture_index += 1
+
+            finish_progress(video_summary["extracted_frame_count"])
+            summary["videos"].append(video_summary)
+            summary["total_extracted_frames"] += video_summary["extracted_frame_count"]
+            summary["total_detected_frames"] += video_summary["success_count"]
+            summary["total_no_detection_frames"] += video_summary["no_detection_count"]
+            summary["total_frame_errors"] += video_summary["error_count"]
+            if video_summary["error_count"] == 0:
+                summary["success_count"] += 1
+            else:
+                summary["error_count"] += 1
+        except Exception as exc:
+            summary["errors"].append(
+                {
+                    "video_path": str(video_path),
+                    "error": str(exc),
+                }
+            )
+            summary["error_count"] += 1
+        finally:
+            if capture is not None:
+                capture.release()
+            if writer is not None:
+                writer.release()
+            processed_videos = summary["success_count"] + summary["error_count"]
+            print_progress("Processing videos", processed_videos, len(video_paths))
+
+    finish_progress(len(video_paths))
+    return summary
 
 
 def numeric_median(values):
@@ -1948,6 +2349,18 @@ def draw_l_dimensions(image_bgr, bbox, edge_pair, dimensions, border_color_bgr):
 
 
 def save_annotated_image(image_rgb, component_mask, result, edge_pair, output_path):
+    image_bgr = render_annotated_image(
+        image_rgb=image_rgb,
+        component_mask=component_mask,
+        result=result,
+        edge_pair=edge_pair,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), image_bgr)
+
+
+def render_annotated_image(image_rgb, component_mask, result, edge_pair):
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     border_color_bgr = choose_annotation_color(parse_hex_color(result["detected_color_hex"]))
     overlay_alpha = 0.28
@@ -1986,13 +2399,10 @@ def save_annotated_image(image_rgb, component_mask, result, edge_pair, output_pa
         border_color_bgr=border_color_bgr,
         shape_name=result["shape"],
     )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output_path), image_bgr)
+    return image_bgr
 
 
-def detect_ad_monochrome(image_path, color_hint, shape_hint, tolerance):
-    image_rgb = load_image_rgb(image_path)
+def detect_ad_monochrome_from_rgb(image_rgb, image_label, color_hint, shape_hint, tolerance):
     image_width = image_rgb.shape[1]
     image_height = image_rgb.shape[0]
 
@@ -2031,7 +2441,7 @@ def detect_ad_monochrome(image_path, color_hint, shape_hint, tolerance):
     area_percent = float(area_pixels) / float(image_width * image_height) * 100.0
     validate_ad_area_percent(area_percent, resolved_shape)
     result = {
-        "image_path": str(image_path),
+        "image_path": ensure_image_label(image_label),
         "detected_color_hex": rgb_to_hex(best_component["color_rgb"]),
         "shape": resolved_shape,
         "inferred_shape": inferred_shape,
@@ -2057,8 +2467,18 @@ def detect_ad_monochrome(image_path, color_hint, shape_hint, tolerance):
     return result, render_data
 
 
-def detect_ad_multicolor(image_path, shape_hint, tolerance):
+def detect_ad_monochrome(image_path, color_hint, shape_hint, tolerance):
     image_rgb = load_image_rgb(image_path)
+    return detect_ad_monochrome_from_rgb(
+        image_rgb=image_rgb,
+        image_label=image_path,
+        color_hint=color_hint,
+        shape_hint=shape_hint,
+        tolerance=tolerance,
+    )
+
+
+def detect_ad_multicolor_from_rgb(image_rgb, image_label, shape_hint, tolerance):
     image_width = image_rgb.shape[1]
     image_height = image_rgb.shape[0]
     image_area = image_width * image_height
@@ -2099,7 +2519,7 @@ def detect_ad_multicolor(image_path, shape_hint, tolerance):
     validate_ad_area_percent(area_percent, resolved_shape)
 
     result = {
-        "image_path": str(image_path),
+        "image_path": ensure_image_label(image_label),
         "detected_color_hex": best_component["detected_color_hex"],
         "shape": resolved_shape,
         "inferred_shape": inferred_shape,
@@ -2125,6 +2545,16 @@ def detect_ad_multicolor(image_path, shape_hint, tolerance):
         "edge_pair": edge_pair,
     }
     return result, render_data
+
+
+def detect_ad_multicolor(image_path, shape_hint, tolerance):
+    image_rgb = load_image_rgb(image_path)
+    return detect_ad_multicolor_from_rgb(
+        image_rgb=image_rgb,
+        image_label=image_path,
+        shape_hint=shape_hint,
+        tolerance=tolerance,
+    )
 
 
 def detect_ad(image_path, color_hint, shape_hint, tolerance, ad_mode):
@@ -2157,6 +2587,40 @@ def detect_ad(image_path, color_hint, shape_hint, tolerance, ad_mode):
         )
 
 
+def detect_ad_from_rgb(image_rgb, image_label, color_hint, shape_hint, tolerance, ad_mode):
+    if ad_mode == "multicolor":
+        return detect_ad_multicolor_from_rgb(
+            image_rgb=image_rgb,
+            image_label=image_label,
+            shape_hint=shape_hint,
+            tolerance=tolerance,
+        )
+    if ad_mode == "monochrome":
+        return detect_ad_monochrome_from_rgb(
+            image_rgb=image_rgb,
+            image_label=image_label,
+            color_hint=color_hint,
+            shape_hint=shape_hint,
+            tolerance=tolerance,
+        )
+
+    try:
+        return detect_ad_monochrome_from_rgb(
+            image_rgb=image_rgb,
+            image_label=image_label,
+            color_hint=color_hint,
+            shape_hint=shape_hint,
+            tolerance=tolerance,
+        )
+    except NoAdsDetectedError:
+        return detect_ad_multicolor_from_rgb(
+            image_rgb=image_rgb,
+            image_label=image_label,
+            shape_hint=shape_hint,
+            tolerance=tolerance,
+        )
+
+
 def format_ad_mode_label(ad_mode):
     if ad_mode is None:
         return "auto (monochrome -> multicolor fallback)"
@@ -2177,7 +2641,8 @@ def print_human_readable(result):
         f"x={result['bbox']['x']}, y={result['bbox']['y']}, "
         f"width={result['bbox']['width']}, height={result['bbox']['height']}"
     )
-    print(f"Output image: {result['output_image_path']}")
+    if "output_image_path" in result:
+        print(f"Output image: {result['output_image_path']}")
 
     dimensions = result["dimensions"]
     if result["shape"] == "l":
@@ -2307,6 +2772,7 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
     video_paths = find_source_files(source_dir, "videos")
     summary = {
         "source": "videos",
+        "output_format": "frames",
         "ad_mode": ad_mode,
         "input_dir": str(source_dir),
         "output_dir": str(output_dir),
@@ -2339,6 +2805,7 @@ def process_video_directory(source_dir, output_dir, color_hint, shape_hint, tole
                 "frames_dir": str(frames_dir),
                 "detections_dir": str(detections_dir),
                 "ad_mode": ad_mode,
+                "output_format": "frames",
                 "frame_interval_seconds": frame_interval_seconds,
                 "extracted_frame_count": len(extracted_frames),
                 "success_count": 0,
@@ -2480,9 +2947,15 @@ def print_image_batch_human_readable(summary):
 def print_video_batch_human_readable(summary):
     print(f"Source: {summary['source']}")
     print(f"Ad mode: {format_ad_mode_label(summary['ad_mode'])}")
+    print(f"Output format: {summary.get('output_format', 'frames')}")
     print(f"Input folder: {summary['input_dir']}")
     print(f"Output folder: {summary['output_dir']}")
-    print(f"Frame interval: {summary['frame_interval_seconds']} s")
+    if summary.get("output_format") == "videos":
+        print("Frame interval: not used")
+        print(f"Video detect every: {summary.get('video_detect_every')} frame(s)")
+        print(f"Video detect scale: {summary.get('video_detect_scale')}")
+    else:
+        print(f"Frame interval: {summary['frame_interval_seconds']} s")
     print(
         "Processed videos: "
         f"{summary['processed_count']} | "
@@ -2506,8 +2979,16 @@ def print_video_batch_human_readable(summary):
         print()
         print(f"--- Video {index} ---")
         print(f"Video: {video_summary['video_path']}")
-        print(f"Frames folder: {video_summary['frames_dir']}")
-        print(f"Detections folder: {video_summary['detections_dir']}")
+        if video_summary.get("output_format") == "videos":
+            print(f"Output video: {video_summary['output_video_path']}")
+            print(f"Video FPS: {video_summary.get('video_fps', 'unknown')}")
+            print(
+                f"Detect every: {video_summary.get('video_detect_every')} frame(s) | "
+                f"Detect scale: {video_summary.get('video_detect_scale')}"
+            )
+        else:
+            print(f"Frames folder: {video_summary['frames_dir']}")
+            print(f"Detections folder: {video_summary['detections_dir']}")
         print(
             "Extracted frames: "
             f"{video_summary['extracted_frame_count']} | "
@@ -2537,7 +3018,8 @@ def print_video_batch_human_readable(summary):
                 f"--- Frame Error {frame_index} "
                 f"(t={error_info['timestamp_seconds']:.3f}s, idx={error_info['frame_index']}) ---"
             )
-            print(f"Frame: {error_info['frame_path']}")
+            if "frame_path" in error_info:
+                print(f"Frame: {error_info['frame_path']}")
             print(f"Error: {error_info['error']}")
 
         for frame_index, item in enumerate(video_summary["no_detections"], start=1):
@@ -2549,7 +3031,8 @@ def print_video_batch_human_readable(summary):
             print(f"Frame: {item['frame_path']}")
             print(f"Report: {item['report']}")
             print(f"Reason: {item['reason']}")
-            print(f"Output image: {item['output_image_path']}")
+            if "output_image_path" in item:
+                print(f"Output image: {item['output_image_path']}")
 
     for index, error_info in enumerate(summary["errors"], start=1):
         print()
@@ -2571,15 +3054,27 @@ def main():
     output_dir = output_source_dir(args.source)
 
     if args.source == "videos":
-        summary = process_video_directory(
-            source_dir=source_dir,
-            output_dir=output_dir,
-            color_hint=args.color,
-            shape_hint=args.shape,
-            tolerance=args.tolerance,
-            frame_interval_seconds=args.frame_interval,
-            ad_mode=args.ad_mode,
-        )
+        if args.output_format == "videos":
+            summary = process_video_directory_streaming(
+                source_dir=source_dir,
+                output_dir=output_dir,
+                color_hint=args.color,
+                shape_hint=args.shape,
+                tolerance=args.tolerance,
+                ad_mode=args.ad_mode,
+                video_detect_every=args.video_detect_every,
+                video_detect_scale=args.video_detect_scale,
+            )
+        else:
+            summary = process_video_directory(
+                source_dir=source_dir,
+                output_dir=output_dir,
+                color_hint=args.color,
+                shape_hint=args.shape,
+                tolerance=args.tolerance,
+                frame_interval_seconds=args.frame_interval,
+                ad_mode=args.ad_mode,
+            )
     else:
         summary = process_image_directory(
             source_dir=source_dir,
